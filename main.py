@@ -1,4 +1,5 @@
 import rich
+from datasets import load_dataset
 from transformers import AutoModelForImageTextToText, AutoProcessor, DynamicCache
 from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
@@ -9,10 +10,16 @@ def main():
 
     past_key_values: DynamicCache = DynamicCache(config=model.config)
 
+    ds = load_dataset("rajpurkar/squad", split="validation")
+
     messages = [
         {
             "role": "user",
-            "content": [{"type": "text", "text": "Hello, what's your name."}],
+            "content": [{"type": "text", "text": ds[0]["context"]}],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": ds[0]["question"]}],
         },
     ]
     inputs = processor.apply_chat_template(
@@ -24,7 +31,7 @@ def main():
     ).to(model.device)
 
     outputs = model.generate(
-        **inputs, max_new_tokens=40, past_key_values=past_key_values, use_cache=True
+        **inputs, max_new_tokens=128, past_key_values=past_key_values, use_cache=True
     )
     print(processor.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
 
