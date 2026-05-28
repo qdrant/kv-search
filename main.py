@@ -1,9 +1,14 @@
-from transformers import AutoProcessor, AutoModelForImageTextToText
+import rich
+from transformers import AutoModelForImageTextToText, AutoProcessor, DynamicCache
+from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
 
 def main():
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3.5-0.8B")
     model = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen3.5-0.8B")
+
+    past_key_values: DynamicCache = DynamicCache(config=model.config)
+
     messages = [
         {
             "role": "user",
@@ -18,8 +23,18 @@ def main():
         return_tensors="pt",
     ).to(model.device)
 
-    outputs = model.generate(**inputs, max_new_tokens=40)
+    outputs = model.generate(
+        **inputs, max_new_tokens=40, past_key_values=past_key_values, use_cache=True
+    )
     print(processor.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
+
+    for layer in past_key_values.layers:
+        if isinstance(layer, CacheLayerMixin):
+            assert layer.keys is not None and layer.values is not None
+            rich.print(layer.keys.shape, layer.values.shape)
+        if isinstance(layer, LinearAttentionCacheLayerMixin):
+            assert layer.conv_states is not None and layer.recurrent_states is not None
+            rich.print(layer.conv_states.shape, layer.recurrent_states.shape)
 
 
 if __name__ == "__main__":
