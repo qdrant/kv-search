@@ -27,13 +27,31 @@ class QueryAwareCache(DynamicCache):
         super().__init__(**kwargs)
         self.query_states: dict[int, list[torch.Tensor]] = {}
 
-    def update(
-        self, key_states, value_states, layer_idx, *args, query_states=None, **kwargs
-    ):
+    #def update(
+    #    self, key_states, value_states, layer_idx, *args, query_states=None, **kwargs
+    #):
+    #    if query_states is not None:
+    #        self.query_states.setdefault(layer_idx, []).append(query_states.detach().to("cpu"))
+    #    # Eventually: use query_states to select/filter returned K/V here
+    #    return super().update(key_states, value_states, layer_idx, *args, **kwargs)
+    def update(self, key_states, value_states, layer_idx, *args, query_states=None, **kwargs):
         if query_states is not None:
             self.query_states.setdefault(layer_idx, []).append(query_states.detach())
-        # Eventually: use query_states to select/filter returned K/V here
-        return super().update(key_states, value_states, layer_idx, *args, **kwargs)
+
+        # Bring current layer back to GPU if offloaded
+        layer = self.layers[layer_idx]
+        if layer.is_initialized and layer.keys.device != key_states.device:
+            layer.keys = layer.keys.to(key_states.device)
+            layer.values = layer.values.to(key_states.device)
+
+        keys, values = super().update(key_states, value_states, layer_idx, *args, **kwargs)
+
+        # Offload to CPU after update
+        layer.keys = layer.keys.to("cpu")
+        layer.values = layer.values.to("cpu")
+
+        return keys, values
+
 
 
 def _query_aware_attention_forward(
@@ -81,6 +99,12 @@ def _query_aware_attention_forward(
         scaling=self.scaling,
         **kwargs,
     )
+    #if past_key_values is not None and isinstance(past_key_values, QueryAwareCache):
+    #    layer = past_key_values.layers[self.layer_idx]
+    #    if layer.is_initialized:
+    #        layer.keys = layer.keys.to("cpu", non_blocking=True)
+    #        layer.values = layer.values.to("cpu", non_blocking=True)
+
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)
