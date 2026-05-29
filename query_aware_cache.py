@@ -31,7 +31,7 @@ class QueryAwareCache(DynamicCache):
         self, key_states, value_states, layer_idx, *args, query_states=None, **kwargs
     ):
         if query_states is not None:
-            self.query_states.setdefault(layer_idx, []).append(query_states.detach())
+            self.query_states.setdefault(layer_idx, []).append(query_states.detach().cpu())
 
         # Bring current layer back to GPU if offloaded
         layer = self.layers[layer_idx]

@@ -21,13 +21,13 @@ def main():
     )
 
     bind_query_aware_cache(model)
-    past_key_values = QueryAwareCache(config=model.config, offloading=True)
+    past_key_values = QueryAwareCache(config=model.config)
     # past_key_values = DynamicCache(config=model.config, offloading=True)
 
     ds = load_dataset("rajpurkar/squad", split="validation")
 
     total = 0
-    for j in range(32):
+    for j in range(48):
         messages = [
             {
                 "role": "user",
@@ -46,9 +46,9 @@ def main():
         print(inputs["input_ids"].shape[-1])
         total += inputs["input_ids"].shape[-1]
         print(f"{j=} {total=}")
-        input_chunks = torch.split(inputs["input_ids"], 512, -1)
-        attention_masks = torch.split(inputs["attention_mask"], 512, -1)
-        mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 512, -1)
+        input_chunks = torch.split(inputs["input_ids"], 1024, -1)
+        attention_masks = torch.split(inputs["attention_mask"], 1024, -1)
+        mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 1024, -1)
         for input_ids, attention_mask, mm_token_type_ids in zip(
             input_chunks, attention_masks, mm_token_type_chunks
         ):
