@@ -1,14 +1,16 @@
 import rich
 from datasets import load_dataset
-from transformers import AutoModelForImageTextToText, AutoProcessor, DynamicCache
+from transformers import AutoModelForImageTextToText, AutoProcessor
 from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
+from query_aware_cache import QueryAwareCache, bind_query_aware_cache
 
 
 def main():
     processor = AutoProcessor.from_pretrained("Qwen/Qwen3.5-0.8B")
     model = AutoModelForImageTextToText.from_pretrained("Qwen/Qwen3.5-0.8B")
 
-    past_key_values: DynamicCache = DynamicCache(config=model.config)
+    bind_query_aware_cache(model)
+    past_key_values = QueryAwareCache(config=model.config)
 
     ds = load_dataset("rajpurkar/squad", split="validation")
 
@@ -42,6 +44,8 @@ def main():
         if isinstance(layer, LinearAttentionCacheLayerMixin):
             assert layer.conv_states is not None and layer.recurrent_states is not None
             rich.print(layer.conv_states.shape, layer.recurrent_states.shape)
+    for layer_idx, queries in past_key_values.query_states.items():
+        rich.print(f"layer {layer_idx}: {len(queries)} query snapshots, shape {queries[0].shape}")
 
 
 if __name__ == "__main__":
