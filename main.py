@@ -56,8 +56,11 @@ def main():
             attention_mask = attention_mask.to(model.device)
             mm_token_type_ids = mm_token_type_ids.to(model.device)
             with torch.no_grad():
-                with torch.backends.cuda.sdp_kernel(
-                    enable_flash=True, enable_math=False, enable_mem_efficient=True
+                with torch.nn.attention.sdpa_kernel(
+                    [
+                        torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                        torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+                    ]
                 ):
                     past_key_values = model(
                         input_ids=input_ids,
