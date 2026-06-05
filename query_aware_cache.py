@@ -25,13 +25,16 @@ class QueryAwareCache(DynamicCache):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.query_states: dict[int, list[torch.Tensor]] = {}
+        self.queries: list[torch.Tensor | None] = [None] * len(self.layers)
 
     def update(
         self, key_states, value_states, layer_idx, *args, query_states=None, **kwargs
     ):
         if query_states is not None:
-            self.query_states.setdefault(layer_idx, []).append(query_states.detach().cpu())
+            if self.queries[layer_idx] is None:
+                self.queries[layer_idx] = query_states.detach().cpu()
+            else:
+                self.queries[layer_idx] = torch.cat([self.queries[layer_idx], query_states.detach().cpu()], dim=-2)
 
         # Bring current layer back to GPU if offloaded
         layer = self.layers[layer_idx]
