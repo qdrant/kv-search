@@ -25,22 +25,18 @@ def main():
     # past_key_values = DynamicCache(config=model.config, offloading=True)
 
     ds = load_dataset("rajpurkar/squad", split="train")
+    contexts: set[str] = {ds[i]["context"] for i in range(len(ds))}
+    batches = list(batched(contexts, 16))
 
     total = 0
     i = 0
-    seen: set[str] = set()
     while total < 100000:
-        if ds[i]["context"] in seen:
-            i += 1
-            continue
-
         messages = [
             {
                 "role": "user",
-                "content": [{"type": "text", "text": ds[i]["context"]}],
-            }
+                "content": [{"type": "text", "text": context}],
+            } for context in batches[i]
         ]
-        seen.add(ds[i]["context"])
         i += 1
         # rich.print(messages)
         inputs = processor.apply_chat_template(
