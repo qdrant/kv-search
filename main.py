@@ -28,7 +28,7 @@ def main():
 
     total = 0
     i = 0
-    seen = set()
+    seen: set[str] = set()
     while total < 100000:
         if ds[i]["context"] in seen:
             i += 1
@@ -40,7 +40,7 @@ def main():
                 "content": [{"type": "text", "text": ds[i]["context"]}],
             }
         ]
-        seen += ds[i]["context"]
+        seen.add(ds[i]["context"])
         i += 1
         # rich.print(messages)
         inputs = processor.apply_chat_template(
