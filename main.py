@@ -24,17 +24,24 @@ def main():
     past_key_values = QueryAwareCache(config=model.config)
     # past_key_values = DynamicCache(config=model.config, offloading=True)
 
-    ds = load_dataset("rajpurkar/squad", split="validation")
+    ds = load_dataset("rajpurkar/squad", split="train")
 
     total = 0
-    for j in range(48):
+    i = 0
+    seen = set()
+    while total < 100000:
+        if ds[i]["context"] in seen:
+            i += 1
+            continue
+
         messages = [
             {
                 "role": "user",
                 "content": [{"type": "text", "text": ds[i]["context"]}],
             }
-            for i in range(j * 16, j * 16 + 16)
         ]
+        seen += ds[i]["context"]
+        i += 1
         # rich.print(messages)
         inputs = processor.apply_chat_template(
             messages,
@@ -45,7 +52,7 @@ def main():
         )
         print(inputs["input_ids"].shape[-1])
         total += inputs["input_ids"].shape[-1]
-        print(f"{j=} {total=}")
+        print(f"{i=} {total=}")
         input_chunks = torch.split(inputs["input_ids"], 1024, -1)
         attention_masks = torch.split(inputs["attention_mask"], 1024, -1)
         mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 1024, -1)
@@ -114,6 +121,7 @@ def main():
         **inputs, max_new_tokens=512, past_key_values=past_key_values, use_cache=True
     )
     print(processor.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
+    print(f"{past_key_values.get_seq_length()=}")
 
     # for layer in past_key_values.layers:
     #    if isinstance(layer, CacheLayerMixin):
