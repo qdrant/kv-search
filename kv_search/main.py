@@ -6,30 +6,35 @@ from kv_search.data import load_dataset, Datasets, Message
 from transformers import (
     AutoProcessor,
     AutoModelForCausalLM,
-    Qwen3_5Model,
-    Qwen2Model,
     Qwen3VLProcessor,
     Qwen2Tokenizer,
     BatchEncoding,
-    Mistral3Model,
     Mistral3ForConditionalGeneration,
     Qwen3_5ForConditionalGeneration,
     Qwen2ForCausalLM,
     PixtralProcessor,
+    AutoModelForMultimodalLM,
+    Gemma3ForConditionalGeneration,
+    Gemma3Processor,
 )
 from transformers.cache_utils import CacheLayerMixin
 from kv_search.query_aware_cache import QueryAwareCache, bind_query_aware_cache
 from safetensors.torch import save_file
 
-IS_MULTIMODAL = {"qwen3_5"}
+IS_MULTIMODAL = {
+    "Qwen/Qwen3.5-9B",
+    "mistralai/Ministral-3-8B-Reasoning-2512",
+    "google/gemma-3-4b-it",
+}
 
 
 ModelType = (
     Qwen3_5ForConditionalGeneration
     | Qwen2ForCausalLM
     | Mistral3ForConditionalGeneration
+    | Gemma3ForConditionalGeneration
 )
-ProcessorType = Qwen3VLProcessor | Qwen2Tokenizer | PixtralProcessor
+ProcessorType = Qwen3VLProcessor | Qwen2Tokenizer | PixtralProcessor | Gemma3Processor
 
 
 def _do_prefill(
@@ -78,14 +83,17 @@ def _do_prefill(
 
 def main(
     model_name: Literal[
-        "Qwen/Qwen3.5-9B", "Qwen/Qwen2.5-7B", "mistralai/Ministral-3-8B-Reasoning-2512"
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen2.5-7B",
+        "mistralai/Ministral-3-8B-Reasoning-2512",
+        "google/gemma-3-4b-it",
     ],
     dataset_name: Datasets,
 ):
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
-    if model_name == "mistralai/Ministral-3-8B-Reasoning-2512":
+    if model_name in IS_MULTIMODAL:
         model: ModelType = (
-            Mistral3ForConditionalGeneration.from_pretrained(
+            AutoModelForMultimodalLM.from_pretrained(
                 model_name, attn_implementation="sdpa", dtype=torch.bfloat16
             )
             .eval()
@@ -103,9 +111,7 @@ def main(
     bind_query_aware_cache(model)
     past_key_values = QueryAwareCache(config=model.config)
 
-    messages = load_dataset(
-        dataset_name, multimodal=model.config.model_type in ["qwen3_5", "mistral3"]
-    )
+    messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
 
     _do_prefill(messages, model, processor, past_key_values)
 

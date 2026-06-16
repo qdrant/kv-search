@@ -8,6 +8,7 @@ from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Attention
+from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
 
 
 class QueryAwareCache(DynamicCache):
@@ -218,6 +219,59 @@ def _ministral3_forward(
     return attn_output, attn_weights
 
 
+def _gemma3_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: torch.Tensor = None,
+    attention_mask: torch.Tensor | None = None,
+    past_key_values: Cache | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
+    from transformers.models.gemma3.modeling_gemma3 import (
+        ALL_ATTENTION_FUNCTIONS,
+        apply_rotary_pos_emb,
+        eager_attention_forward,
+    )
+
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    query_states = self.q_norm(query_states)
+    key_states = self.k_norm(key_states)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(
+            key_states, value_states, self.layer_idx
+        )
+
+    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
+
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=self.attention_dropout if self.training else 0.0,
+        scaling=self.scaling,
+        sliding_window=self.sliding_window,
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
+
 def bind_query_aware_cache(model) -> None:
     """
     Patch every Qwen3_5Attention layer in the model to forward query states to
@@ -234,3 +288,5 @@ def bind_query_aware_cache(model) -> None:
             module.forward = types.MethodType(_qwen_2_5_forward, module)
         if isinstance(module, Ministral3Attention):
             module.forward = types.MethodType(_ministral3_forward, module)
+        if isinstance(module, Gemma3Attention):
+            module.forward = types.MethodType(_gemma3_forward, module)
