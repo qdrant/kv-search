@@ -7,6 +7,7 @@ from transformers.cache_utils import Cache
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
+from transformers.models.ministral3.modeling_ministral3 import Ministral3Attention
 
 
 class QueryAwareCache(DynamicCache):
@@ -50,7 +51,7 @@ class QueryAwareCache(DynamicCache):
         return keys, values
 
 
-def _qwen_3_5_query_aware_attention_forward(
+def _qwen_3_5_forward(
     self: Qwen3_5Attention,
     hidden_states: torch.Tensor,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -158,6 +159,65 @@ def _qwen_2_5_forward(
     return attn_output, attn_weights
 
 
+def _ministral3_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    attention_mask: torch.Tensor | None,
+    position_ids: torch.Tensor,
+    past_key_values: Cache | None = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    from transformers.models.ministral3.modeling_ministral3 import (
+        ALL_ATTENTION_FUNCTIONS,
+        apply_rotary_pos_emb,
+        eager_attention_forward,
+        get_llama_4_attn_scale,
+    )
+
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    query_states = query_states * get_llama_4_attn_scale(
+        position_ids,
+        self.config.rope_parameters.get("llama_4_scaling_beta"),
+        self.config.rope_parameters.get("original_max_position_embeddings"),
+    ).to(query_states.dtype)
+
+    if past_key_values is not None:
+        key_states, value_states = past_key_values.update(
+            key_states, value_states, self.layer_idx, query_states=query_states
+        )
+
+    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+        self.config._attn_implementation, eager_attention_forward
+    )
+
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=getattr(
+            self.config, "sliding_window", None
+        ),  # main diff with Llama
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
+
 def bind_query_aware_cache(model) -> None:
     """
     Patch every Qwen3_5Attention layer in the model to forward query states to
@@ -169,8 +229,8 @@ def bind_query_aware_cache(model) -> None:
     """
     for module in model.modules():
         if isinstance(module, Qwen3_5Attention):
-            module.forward = types.MethodType(
-                _qwen_3_5_query_aware_attention_forward, module
-            )
+            module.forward = types.MethodType(_qwen_3_5_forward, module)
         if isinstance(module, Qwen2Attention):
             module.forward = types.MethodType(_qwen_2_5_forward, module)
+        if isinstance(module, Ministral3Attention):
+            module.forward = types.MethodType(_ministral3_forward, module)

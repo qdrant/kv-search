@@ -11,6 +11,11 @@ from transformers import (
     Qwen3VLProcessor,
     Qwen2Tokenizer,
     BatchEncoding,
+    Mistral3Model,
+    Mistral3ForConditionalGeneration,
+    Qwen3_5ForConditionalGeneration,
+    Qwen2ForCausalLM,
+    PixtralProcessor,
 )
 from transformers.cache_utils import CacheLayerMixin
 from kv_search.query_aware_cache import QueryAwareCache, bind_query_aware_cache
@@ -19,8 +24,12 @@ from safetensors.torch import save_file
 IS_MULTIMODAL = {"qwen3_5"}
 
 
-ModelType = Qwen3_5Model | Qwen2Model
-ProcessorType = Qwen3VLProcessor | Qwen2Tokenizer
+ModelType = (
+    Qwen3_5ForConditionalGeneration
+    | Qwen2ForCausalLM
+    | Mistral3ForConditionalGeneration
+)
+ProcessorType = Qwen3VLProcessor | Qwen2Tokenizer | PixtralProcessor
 
 
 def _do_prefill(
@@ -68,22 +77,34 @@ def _do_prefill(
 
 
 def main(
-    model_name: Literal["Qwen/Qwen3.5-9B", "Qwen/Qwen2.5-7B"], dataset_name: Datasets
+    model_name: Literal[
+        "Qwen/Qwen3.5-9B", "Qwen/Qwen2.5-7B", "mistralai/Ministral-3-8B-Reasoning-2512"
+    ],
+    dataset_name: Datasets,
 ):
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
-    model: ModelType = (
-        AutoModelForCausalLM.from_pretrained(
-            model_name, attn_implementation="sdpa", dtype=torch.bfloat16
+    if model_name == "mistralai/Ministral-3-8B-Reasoning-2512":
+        model: ModelType = (
+            Mistral3ForConditionalGeneration.from_pretrained(
+                model_name, attn_implementation="sdpa", dtype=torch.bfloat16
+            )
+            .eval()
+            .to("cuda")
         )
-        .eval()
-        .to("cuda")
-    )
+    else:
+        model: ModelType = (
+            AutoModelForCausalLM.from_pretrained(
+                model_name, attn_implementation="sdpa", dtype=torch.bfloat16
+            )
+            .eval()
+            .to("cuda")
+        )
 
     bind_query_aware_cache(model)
     past_key_values = QueryAwareCache(config=model.config)
 
     messages = load_dataset(
-        dataset_name, multimodal=model.config.model_type in ["qwen3_5"]
+        dataset_name, multimodal=model.config.model_type in ["qwen3_5", "mistral3"]
     )
 
     _do_prefill(messages, model, processor, past_key_values)
@@ -124,8 +145,11 @@ def main(
     inputs = inputs.to(model.device)
 
     outputs = model.generate(
-        **inputs, max_new_tokens=128, past_key_values=past_key_values, use_cache=True
-    )  # ty:ignore[call-non-callable]
+        **inputs,  # ty:ignore[invalid-argument-type]
+        max_new_tokens=128,
+        past_key_values=past_key_values,
+        use_cache=True,
+    )  # ty:ignore[invalid-argument-type]
     print(processor.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
     print(f"{past_key_values.get_seq_length()=}")
 
