@@ -16,6 +16,8 @@ from transformers import (
     AutoModelForMultimodalLM,
     Gemma3ForConditionalGeneration,
     Gemma3Processor,
+    Gemma4ForConditionalGeneration,
+    Gemma4Processor,
 )
 from transformers.cache_utils import CacheLayerMixin
 from kv_search.query_aware_cache import QueryAwareCache, bind_query_aware_cache
@@ -25,6 +27,7 @@ IS_MULTIMODAL = {
     "Qwen/Qwen3.5-9B",
     "mistralai/Ministral-3-8B-Reasoning-2512",
     "google/gemma-3-4b-it",
+    "google/gemma-4-12B",
 }
 
 
@@ -33,8 +36,15 @@ ModelType = (
     | Qwen2ForCausalLM
     | Mistral3ForConditionalGeneration
     | Gemma3ForConditionalGeneration
+    | Gemma4ForConditionalGeneration
 )
-ProcessorType = Qwen3VLProcessor | Qwen2Tokenizer | PixtralProcessor | Gemma3Processor
+ProcessorType = (
+    Qwen3VLProcessor
+    | Qwen2Tokenizer
+    | PixtralProcessor
+    | Gemma3Processor
+    | Gemma4Processor
+)
 
 
 def _do_prefill(
@@ -87,6 +97,7 @@ def main(
         "Qwen/Qwen2.5-7B",
         "mistralai/Ministral-3-8B-Reasoning-2512",
         "google/gemma-3-4b-it",
+        "google/gemma-4-12B",
     ],
     dataset_name: Datasets,
 ):
@@ -173,7 +184,7 @@ def main(
     for i, tensor_dict in enumerate(tensors):
         save_file(
             tensor_dict,
-            f"layer_{i}_tensors.safetensors",
+            f"cache/{dataset_name}/{model.config.model_type}/layer_{i}_tensors.safetensors",
         )
 
 
