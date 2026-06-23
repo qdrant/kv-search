@@ -29,6 +29,8 @@ class QueryAwareCache(DynamicCache):
         self, key_states, value_states, layer_idx, *args, query_states=None, **kwargs
     ):
         if query_states is not None:
+            if layer_idx >= len(self.queries):
+                self.queries.extend([None] * (layer_idx - len(self.queries) + 1))
             if self.queries[layer_idx] is None:
                 self.queries[layer_idx] = query_states.detach().cpu()
             else:
@@ -37,14 +39,17 @@ class QueryAwareCache(DynamicCache):
                 )
 
         # Bring current layer back to GPU if offloaded
-        layer = self.layers[layer_idx]
-        if layer.is_initialized and layer.keys.device != key_states.device:
-            layer.keys = layer.keys.to(key_states.device)
-            layer.values = layer.values.to(key_states.device)
+        if layer_idx < len(self.layers):
+            layer = self.layers[layer_idx]
+            if layer.is_initialized and layer.keys.device != key_states.device:
+                layer.keys = layer.keys.to(key_states.device)
+                layer.values = layer.values.to(key_states.device)
 
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
         )
+
+        layer = self.layers[layer_idx]
 
         # Offload to CPU after update
         layer.keys = layer.keys.to("cpu")

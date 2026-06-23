@@ -46,7 +46,8 @@ def load_dataset(dataset_name: Datasets, multimodal: bool = False) -> Message:
         )
     elif dataset_name == Datasets.NIAH:
         local_dir = Path(snapshot_download("MiniMaxAI/MR-NIAH", repo_type="dataset"))
-        data_file = local_dir / "english/102400_tokens.jsonl"
+        # data_file = local_dir / "english/102400_tokens.jsonl"
+        data_file = local_dir / "english/71680_tokens.jsonl"
 
         if not data_file.is_file():
             raise RuntimeError

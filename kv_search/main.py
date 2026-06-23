@@ -2,6 +2,8 @@ from typing import Literal
 import rich
 from rich.progress import track
 import torch
+import os
+from pathlib import Path
 
 from kv_search.data import load_dataset, Datasets, Message
 from transformers import (
@@ -19,6 +21,7 @@ from transformers import (
     Gemma3Processor,
     Gemma4ForConditionalGeneration,
     Gemma4Processor,
+    FineGrainedFP8Config,
 )
 from transformers.cache_utils import CacheLayerMixin
 from kv_search.query_aware_cache import QueryAwareCache, bind_query_aware_cache
@@ -26,7 +29,7 @@ from safetensors.torch import save_file
 
 IS_MULTIMODAL = {
     "Qwen/Qwen3.5-9B",
-    "mistralai/Ministral-3-8B-Reasoning-2512",
+    "mistralai/Ministral-3-8B-Instruct-2512",
     "google/gemma-3-4b-it",
     "google/gemma-4-12B-it",
 }
@@ -61,10 +64,12 @@ def _do_prefill(
         return_dict=True,
         return_tensors="pt",
     )  # ty:ignore[invalid-assignment]
-    input_chunks = torch.split(inputs["input_ids"], 1024, -1)
-    attention_masks = torch.split(inputs["attention_mask"], 1024, -1)
+    print(f"{inputs['input_ids'].shape=}")
+    print(f"{len(past_key_values)=}")
+    input_chunks = torch.split(inputs["input_ids"], 512, -1)
+    attention_masks = torch.split(inputs["attention_mask"], 512, -1)
     if "mm_token_type_ids" in inputs:
-        mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 1024, -1)
+        mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 512, -1)
 
     for i, (input_ids, attention_mask) in track(
         enumerate(zip(input_chunks, attention_masks)),
@@ -100,7 +105,7 @@ def main(
     model_name: Literal[
         "Qwen/Qwen3.5-9B",
         "Qwen/Qwen2.5-7B",
-        "mistralai/Ministral-3-8B-Reasoning-2512",
+        "mistralai/Ministral-3-8B-Instruct-2512",
         "google/gemma-3-4b-it",
         "google/gemma-4-12B-it",
     ],
@@ -113,6 +118,7 @@ def main(
             attn_implementation="sdpa",
             dtype=torch.bfloat16,
             device_map="auto",
+            # quantization_config=FineGrainedFP8Config(dequantize=True)
         ).eval()
     else:
         model: ModelType = AutoModelForCausalLM.from_pretrained(
@@ -123,7 +129,7 @@ def main(
         ).eval()
 
     bind_query_aware_cache(model)
-    past_key_values = QueryAwareCache(config=model.config)
+    past_key_values = QueryAwareCache()
 
     messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
 
@@ -166,7 +172,7 @@ def main(
 
     outputs = model.generate(
         **inputs,  # ty:ignore[invalid-argument-type]
-        max_new_tokens=128,
+        max_new_tokens=16,
         past_key_values=past_key_values,
         use_cache=True,
     )  # ty:ignore[invalid-argument-type]
@@ -183,6 +189,8 @@ def main(
         for i in range(len(past_key_values.layers))
         if isinstance(past_key_values.layers[i], CacheLayerMixin)
     ]
+
+    Path(f"cache/{dataset_name}/{model.config.model_type}").mkdir(exist_ok=True, parents=True)
 
     for i, tensor_dict in enumerate(tensors):
         save_file(
