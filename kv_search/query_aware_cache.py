@@ -9,7 +9,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Attention
 from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
-from transformers.models.gemma4.modeling_gemma4 import Gemma4TextAttention
+from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedTextAttention
 
 
 class QueryAwareCache(DynamicCache):
@@ -281,7 +281,7 @@ def _gemma4_forward(
     past_key_values: Cache | None = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    from transformers.models.gemma4.modeling_gemma4 import (
+    from transformers.models.gemma4_unified.modeling_gemma4_unified import (
         ALL_ATTENTION_FUNCTIONS,
         apply_rotary_pos_emb,
         eager_attention_forward,
@@ -361,5 +361,5 @@ def bind_query_aware_cache(model) -> None:
             module.forward = types.MethodType(_ministral3_forward, module)
         if isinstance(module, Gemma3Attention):
             module.forward = types.MethodType(_gemma3_forward, module)
-        if isinstance(module, Gemma4TextAttention):
+        if isinstance(module, Gemma4UnifiedTextAttention):
             module.forward = types.MethodType(_gemma4_forward, module)

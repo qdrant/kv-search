@@ -15,3 +15,7 @@ dependencies = [
     "torchvision>=0.27.0",
     "transformers>=5.9.0",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

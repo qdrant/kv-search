@@ -1,5 +1,6 @@
 from typing import Literal
 import rich
+from rich.progress import track
 import torch
 
 from kv_search.data import load_dataset, Datasets, Message
@@ -27,7 +28,7 @@ IS_MULTIMODAL = {
     "Qwen/Qwen3.5-9B",
     "mistralai/Ministral-3-8B-Reasoning-2512",
     "google/gemma-3-4b-it",
-    "google/gemma-4-12B",
+    "google/gemma-4-12B-it",
 }
 
 
@@ -65,7 +66,11 @@ def _do_prefill(
     if "mm_token_type_ids" in inputs:
         mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 1024, -1)
 
-    for i, (input_ids, attention_mask) in enumerate(zip(input_chunks, attention_masks)):
+    for i, (input_ids, attention_mask) in track(
+        enumerate(zip(input_chunks, attention_masks)),
+        total=len(input_chunks),
+        description="Computing Prefill",
+    ):
         input_ids = input_ids.to(model.device)
         attention_mask = attention_mask.to(model.device)
 
@@ -97,27 +102,25 @@ def main(
         "Qwen/Qwen2.5-7B",
         "mistralai/Ministral-3-8B-Reasoning-2512",
         "google/gemma-3-4b-it",
-        "google/gemma-4-12B",
+        "google/gemma-4-12B-it",
     ],
     dataset_name: Datasets,
 ):
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
     if model_name in IS_MULTIMODAL:
-        model: ModelType = (
-            AutoModelForMultimodalLM.from_pretrained(
-                model_name, attn_implementation="sdpa", dtype=torch.bfloat16
-            )
-            .eval()
-            .to("cuda")
-        )
+        model: ModelType = AutoModelForMultimodalLM.from_pretrained(
+            model_name,
+            attn_implementation="sdpa",
+            dtype=torch.bfloat16,
+            device_map="auto",
+        ).eval()
     else:
-        model: ModelType = (
-            AutoModelForCausalLM.from_pretrained(
-                model_name, attn_implementation="sdpa", dtype=torch.bfloat16
-            )
-            .eval()
-            .to("cuda")
-        )
+        model: ModelType = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            attn_implementation="sdpa",
+            dtype=torch.bfloat16,
+            device_map="auto",
+        ).eval()
 
     bind_query_aware_cache(model)
     past_key_values = QueryAwareCache(config=model.config)
@@ -189,4 +192,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main("Qwen/Qwen2.5-7B", dataset_name=Datasets.NIAH)
+    main("google/gemma-4-12B-it", dataset_name=Datasets.NIAH)
