@@ -67,10 +67,10 @@ def _do_prefill(
     )  # ty:ignore[invalid-assignment]
     print(f"{inputs['input_ids'].shape=}")
     print(f"{len(past_key_values)=}")
-    input_chunks = torch.split(inputs["input_ids"], 512, -1)
-    attention_masks = torch.split(inputs["attention_mask"], 512, -1)
+    input_chunks = torch.split(inputs["input_ids"], 2048, -1)
+    attention_masks = torch.split(inputs["attention_mask"], 2048, -1)
     if "mm_token_type_ids" in inputs:
-        mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 512, -1)
+        mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 2048, -1)
 
     for i, (input_ids, attention_mask) in track(
         enumerate(zip(input_chunks, attention_masks)),
@@ -118,16 +118,13 @@ def main(
             model_name,
             attn_implementation="sdpa",
             dtype=torch.bfloat16,
-            device_map="auto",
-            # quantization_config=FineGrainedFP8Config(dequantize=True)
-        ).eval()
+        ).cuda().eval()
     else:
         model: ModelType = AutoModelForCausalLM.from_pretrained(
             model_name,
             attn_implementation="sdpa",
             dtype=torch.bfloat16,
-            device_map="auto",
-        ).eval()
+        ).cuda().eval()  # ty:ignore[missing-argument]
 
     bind_query_aware_cache(model)
     past_key_values = QueryAwareCache(config=model.config)
@@ -186,11 +183,11 @@ def main(
 
     for i, tensor_dict in enumerate(tensors):
         with compression.zstd.open(
-            f"cache/{dataset_name}/{model.config.model_type}/layer_{i}_tensors.safetensors",
+            f"cache/{dataset_name}/{model.config.model_type}/layer_{i}_tensors.safetensors.zst",
             "wb",
         ) as f:
             f.write(save(tensor_dict))
 
 
 if __name__ == "__main__":
-    main("Qwen/Qwen3.5-9B", dataset_name=Datasets.NIAH)
+    main("Qwen/Qwen3.5-9B", dataset_name=Datasets.QDRANT)
