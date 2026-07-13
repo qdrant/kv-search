@@ -1,31 +1,32 @@
-from typing import Literal
-import rich
-from rich.progress import track
-import torch
-import os
+import compression.zstd
 from pathlib import Path
+from typing import Literal
 
-from kv_search.data import load_dataset, Datasets, Message
+import rich
+import torch
+from rich.progress import track
+from safetensors.torch import save
 from transformers import (
-    AutoProcessor,
     AutoModelForCausalLM,
-    Qwen3VLProcessor,
-    Qwen2Tokenizer,
-    BatchEncoding,
-    Mistral3ForConditionalGeneration,
-    Qwen3_5ForConditionalGeneration,
-    Qwen2ForCausalLM,
-    PixtralProcessor,
     AutoModelForMultimodalLM,
+    AutoProcessor,
+    BatchEncoding,
     Gemma3ForConditionalGeneration,
     Gemma3Processor,
     Gemma4ForConditionalGeneration,
     Gemma4Processor,
-    FineGrainedFP8Config, TextStreamer,
+    Mistral3ForConditionalGeneration,
+    PixtralProcessor,
+    Qwen2ForCausalLM,
+    Qwen2Tokenizer,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3VLProcessor,
+    TextStreamer,
 )
 from transformers.cache_utils import CacheLayerMixin
+
+from kv_search.data import Datasets, Message, load_dataset
 from kv_search.query_aware_cache import QueryAwareCache, bind_query_aware_cache
-from safetensors.torch import save_file
 
 IS_MULTIMODAL = {
     "Qwen/Qwen3.5-9B",
@@ -147,7 +148,7 @@ def main(
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
-        enable_thinking=False
+        enable_thinking=False,
     )  # ty:ignore[invalid-assignment]
     inputs["attention_mask"] = torch.cat(
         [
@@ -179,13 +180,16 @@ def main(
         if isinstance(past_key_values.layers[i], CacheLayerMixin)
     ]
 
-    Path(f"cache/{dataset_name}/{model.config.model_type}").mkdir(exist_ok=True, parents=True)
+    Path(f"cache/{dataset_name}/{model.config.model_type}").mkdir(
+        exist_ok=True, parents=True
+    )
 
     for i, tensor_dict in enumerate(tensors):
-        save_file(
-            tensor_dict,
+        with compression.zstd.open(
             f"cache/{dataset_name}/{model.config.model_type}/layer_{i}_tensors.safetensors",
-        )
+            "wb",
+        ) as f:
+            f.write(save(tensor_dict))
 
 
 if __name__ == "__main__":
