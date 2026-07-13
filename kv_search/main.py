@@ -21,7 +21,7 @@ from transformers import (
     Gemma3Processor,
     Gemma4ForConditionalGeneration,
     Gemma4Processor,
-    FineGrainedFP8Config,
+    FineGrainedFP8Config, TextStreamer,
 )
 from transformers.cache_utils import CacheLayerMixin
 from kv_search.query_aware_cache import QueryAwareCache, bind_query_aware_cache
@@ -129,7 +129,9 @@ def main(
         ).eval()
 
     bind_query_aware_cache(model)
-    past_key_values = QueryAwareCache()
+    past_key_values = QueryAwareCache(config=model.config)
+
+    streamer = TextStreamer(processor.tokenizer)
 
     messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
 
@@ -145,14 +147,8 @@ def main(
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
+        enable_thinking=False
     )  # ty:ignore[invalid-assignment]
-    inputs["input_ids"] = torch.cat(
-        [
-            torch.zeros(1, past_key_values.get_seq_length(), dtype=torch.long),
-            inputs["input_ids"],
-        ],
-        dim=1,
-    )
     inputs["attention_mask"] = torch.cat(
         [
             torch.ones(1, past_key_values.get_seq_length(), dtype=torch.long),
@@ -160,21 +156,14 @@ def main(
         ],
         dim=1,
     )
-    if "mm_token_type_ids" in inputs:
-        inputs["mm_token_type_ids"] = torch.cat(
-            [
-                torch.zeros(1, past_key_values.get_seq_length(), dtype=torch.long),
-                inputs["mm_token_type_ids"],
-            ],
-            dim=1,
-        )
     inputs = inputs.to(model.device)
 
     outputs = model.generate(
         **inputs,  # ty:ignore[invalid-argument-type]
-        max_new_tokens=16,
+        max_new_tokens=256,
         past_key_values=past_key_values,
         use_cache=True,
+        streamer=streamer,
     )  # ty:ignore[invalid-argument-type]
     print(processor.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
     print(f"{past_key_values.get_seq_length()=}")
@@ -200,4 +189,4 @@ def main(
 
 
 if __name__ == "__main__":
-    main("google/gemma-4-12B-it", dataset_name=Datasets.NIAH)
+    main("Qwen/Qwen3.5-9B", dataset_name=Datasets.NIAH)
