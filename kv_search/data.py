@@ -11,6 +11,7 @@ from pydantic import BaseModel
 class Datasets(StrEnum):
     SQUAD = "squad"
     NIAH = "niah"
+    QDRANT = "qdrant"
 
 
 class Message(BaseModel):
@@ -59,5 +60,34 @@ def load_dataset(dataset_name: Datasets, multimodal: bool = False) -> Message:
             for message in messages:
                 message["content"] = [{"type": "text", "text": message["content"]}]
         return Message(prefill=messages[:-1], query=[messages[-1]])
+    elif dataset_name == Datasets.QDRANT:
+        path = Path("./cache/CODEBASE_SUMMARY.md")
+
+        if not path.is_file():
+            raise RuntimeError
+        with path.open("rt") as f:
+            data = f.read()
+
+        return Message(
+            prefill=[
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": data}] if multimodal else data,
+                }
+            ],
+            query=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "The codebase of what project do you have in your context?",
+                        }
+                    ]
+                    if multimodal
+                    else "The codebase of what project do you have in your context?",
+                }
+            ],
+        )
     else:
         raise ValueError
