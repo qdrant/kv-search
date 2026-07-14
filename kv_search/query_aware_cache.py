@@ -1,3 +1,4 @@
+from qdrant_client.models import SearchParams, QueryRequest
 import types
 from typing import Callable, Unpack
 
@@ -9,7 +10,97 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Attention
 from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
-from transformers.models.gemma4_unified.modeling_gemma4_unified import Gemma4UnifiedTextAttention
+from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+    Gemma4UnifiedTextAttention,
+)
+from qdrant_client import QdrantClient
+
+
+class QdrantCache(DynamicCache):
+    """
+    Drop-in replacement for DynamicCache. Receives query states inside update()
+    so they can eventually influence which K/V pairs are returned.
+
+    Captured queries are stored in self.query_states[layer_idx] as a list of
+    tensors (one per forward call), shape [batch, heads, seq_len, head_dim].
+    """
+
+    client: QdrantClient
+
+    def __init__(self, url: str, **kwargs):
+        super().__init__(**kwargs)
+        self.client = QdrantClient(url)
+
+    def update(
+        self,
+        key_states,
+        value_states,
+        layer_idx,
+        *args,
+        query_states: torch.Tensor | None = None,
+        **kwargs,
+    ):
+
+        keys, values = super().update(
+            key_states, value_states, layer_idx, *args, **kwargs
+        )
+
+        cached_keys: list[torch.Tensor] = []
+        cached_values: list[torch.Tensor] = []
+        if query_states is not None:
+            for token_idx in range(query_states.shape[2]):
+                cached_key_per_token: list[torch.Tensor] = []
+                cached_value_per_token: list[torch.Tensor] = []
+                for head_idx in range(key_states.shape[1]):
+                    query_idx = head_idx * 4
+                    data = self.client.query_batch_points(
+                        collection_name=f"layer={(layer_idx - 3)//4};head={head_idx}",
+                        requests=[
+                            QueryRequest(
+                                query=query_states[0, query_idx + i, 0]
+                                .cpu()
+                                .to(torch.float)
+                                .numpy(),
+                                params=SearchParams(exact=True),
+                                with_payload=True,
+                                with_vector=True,
+                                limit=256,
+                            )
+                            for i in range(4)
+                        ],
+                    )
+                    cached_key_head: list[list[float]] = []
+                    cached_value_head: list[list[float]] = []
+                    for q in data:
+                        for p in q.points:
+                            cached_key_head.append(p.vector)
+                            cached_value_head.append(p.payload["value"])
+                    cached_key_per_token.append(
+                        torch.tensor(
+                            cached_key_head, dtype=keys.dtype, device=keys.device
+                        )
+                        .unsqueeze(0)
+                        .unsqueeze(0)
+                    )
+                    cached_value_per_token.append(
+                        torch.tensor(
+                            cached_value_head, dtype=keys.dtype, device=keys.device
+                        )
+                        .unsqueeze(0)
+                        .unsqueeze(0)
+                    )
+                cached_keys.append(torch.cat(cached_key_per_token, dim=1))
+                cached_values.append(torch.cat(cached_value_per_token, dim=1))
+        keys = torch.cat(
+            cached_keys + [keys],
+            dim=2,
+        )
+        values = torch.cat(
+            cached_values + [values],
+            dim=2,
+        )
+
+        return keys, values
 
 
 class QueryAwareCache(DynamicCache):
@@ -277,6 +368,7 @@ def _gemma3_forward(
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights
 
+
 def _gemma4_forward(
     self,
     hidden_states: torch.Tensor,
@@ -291,6 +383,7 @@ def _gemma4_forward(
         apply_rotary_pos_emb,
         eager_attention_forward,
     )
+
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -311,7 +404,11 @@ def _gemma4_forward(
         value_states = value_states.to(query_states.device)
     else:
         key_states = self.k_proj(hidden_states).view(hidden_shape)
-        value_states = self.v_proj(hidden_states).view(hidden_shape) if self.v_proj is not None else key_states
+        value_states = (
+            self.v_proj(hidden_states).view(hidden_shape)
+            if self.v_proj is not None
+            else key_states
+        )
 
         key_states = self.k_norm(key_states)
         key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2)
