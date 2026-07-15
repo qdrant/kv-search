@@ -163,28 +163,31 @@ def main(
     past_key_values = QdrantCache("localhost", config=model.config)
     # past_key_values = CutoffCache(128, config=model.config)
 
-    streamer = TextStreamer(processor.tokenizer)
+    streamer = TextStreamer(processor.tokenizer, skip_prompt=True)
 
     # messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
     # rich.print(messages.query)
-    user = input("> ")
-    inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
-        [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-        enable_thinking=False,
-    )  # ty:ignore[invalid-assignment]
-    inputs = inputs.to(model.device)
+    while True:
+        user = input("\n> ")
+        print("\n")
+        inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            enable_thinking=False,
+        )  # ty:ignore[invalid-assignment]
+        inputs = inputs.to(model.device)
 
-    model.generate(
-        **inputs,  # ty:ignore[invalid-argument-type]
-        max_new_tokens=256,
-        past_key_values=past_key_values,
-        use_cache=True,
-        streamer=streamer,
-    )  # ty:ignore[invalid-argument-type]
+        model.generate(
+            **inputs,  # ty:ignore[invalid-argument-type]
+            max_new_tokens=256,
+            past_key_values=past_key_values,
+            use_cache=True,
+            streamer=streamer,
+        )  # ty:ignore[invalid-argument-type]
+        past_key_values.reset()
 
 
 if __name__ == "__main__":
