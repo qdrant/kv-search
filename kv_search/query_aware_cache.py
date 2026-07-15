@@ -27,6 +27,7 @@ class CutoffCache(DynamicCache):
 
         self.prefill_keys: dict[int, torch.Tensor] = {}
         self.prefill_values: dict[int, torch.Tensor] = {}
+        self.scaling = 256**-0.5
 
         for i in range(8):
             with compression.zstd.open(
@@ -94,7 +95,7 @@ class CutoffCache(DynamicCache):
 
 
             s = self.eager_attention_forward(
-                query_states, self.prefill_keys[layer_idx]#, scaling=
+                query_states, self.prefill_keys[layer_idx], scaling=self.scaling
             )
             _, idx = torch.topk(s, self.cutoff, dim=2)
             idx = idx.sort(dim=2)
