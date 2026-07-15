@@ -206,12 +206,13 @@ class QdrantCache(DynamicCache):
     def __init__(self, url: str, **kwargs):
         super().__init__(**kwargs)
         self.client = QdrantClient(url)
+        self.initial = True
 
     def update(
         self,
-        key_states,
-        value_states,
-        layer_idx,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
         *args,
         query_states: torch.Tensor | None = None,
         **kwargs,
@@ -221,58 +222,81 @@ class QdrantCache(DynamicCache):
             key_states, value_states, layer_idx, *args, **kwargs
         )
 
-        cached_keys: list[torch.Tensor] = []
-        cached_values: list[torch.Tensor] = []
+        cached_idx_per_head: list[torch.Tensor] = []
+        cached_keys_per_head: list[torch.Tensor] = []
+        cached_values_per_head: list[torch.Tensor] = []
         if query_states is not None:
-            for token_idx in range(query_states.shape[2]):
-                cached_key_per_token: list[torch.Tensor] = []
-                cached_value_per_token: list[torch.Tensor] = []
-                for head_idx in range(key_states.shape[1]):
-                    query_idx = head_idx * 4
-                    data = self.client.query_batch_points(
-                        collection_name=f"layer={(layer_idx - 3) // 4};head={head_idx}",
-                        requests=[
-                            QueryRequest(
-                                query=query_states[0, query_idx + i, token_idx]
-                                .cpu()
-                                .to(torch.float)
-                                .numpy(),
-                                params=SearchParams(exact=True),
-                                with_payload=True,
-                                with_vector=True,
-                                limit=4096,
-                            )
-                            for i in range(4)
-                        ],
-                    )
-                    cached_key_head: list[list[float]] = []
-                    cached_value_head: list[list[float]] = []
-                    for r in data:
-                        for p in r.points:
-                            cached_key_head.append(p.vector)
-                            cached_value_head.append(p.payload["value"])
-                    cached_key_per_token.append(
-                        torch.tensor(
-                            cached_key_head, dtype=keys.dtype, device=keys.device
+            for head_idx in range(key_states.shape[1]):
+                query_idx = head_idx * 4
+                data = self.client.query_batch_points(
+                    collection_name=f"layer={(layer_idx - 3) // 4};head={head_idx}",
+                    requests=[
+                        QueryRequest(
+                            query=query_states[0, query_idx + i, token_idx]
+                            .cpu()
+                            .to(torch.float)
+                            .numpy(),
+                            params=SearchParams(exact=True),
+                            with_payload=True,
+                            with_vector=True,
+                            limit=128,
                         )
-                        .unsqueeze(0)
-                        .unsqueeze(0)
+                        for token_idx in range(query_states.shape[2])
+                        for i in range(4)
+                    ],
+                )
+                cached_key_head: list[list[float]] = []
+                cached_value_head: list[list[float]] = []
+                cached_idx_head: list[int] = []
+                for r in data:
+                    for p in r.points:
+                        assert isinstance(p.vector, dict)
+                        assert "key" in p.vector
+                        assert "value" in p.vector
+                        cached_key_head.append(p.vector["key"])
+                        cached_value_head.append(p.vector["value"])
+                        cached_idx_head.append(p.id)
+                cached_idx_per_head.append(
+                    torch.tensor(
+                        cached_idx_head, dtype=torch.long, device=keys.device
                     )
-                    cached_value_per_token.append(
-                        torch.tensor(
-                            cached_value_head, dtype=keys.dtype, device=keys.device
-                        )
-                        .unsqueeze(0)
-                        .unsqueeze(0)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                )
+                cached_keys_per_head.append(
+                    torch.tensor(
+                        cached_key_head, dtype=keys.dtype, device=keys.device
                     )
-                cached_keys.append(torch.cat(cached_key_per_token, dim=1))
-                cached_values.append(torch.cat(cached_value_per_token, dim=1))
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                )
+                cached_values_per_head.append(
+                    torch.tensor(
+                        cached_value_head, dtype=keys.dtype, device=keys.device
+                    )
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                )
+            cached_keys = torch.cat(cached_keys_per_head, dim=1)
+            cached_values = torch.cat(cached_values_per_head, dim=1)
+            cached_idx = torch.cat(cached_idx_per_head, dim=1)
+            sorted_idx = cached_idx.argsort(dim=2)
+            cached_keys = cached_keys.take_along_dim(sorted_idx, dim=2)
+            cached_values = cached_values.take_along_dim(sorted_idx, dim=2)
+            cached_idx = cached_idx.take_along_dim(sorted_idx, dim=2)
+            if self.initial:
+                print(f"{cached_idx.shape=}")
+                print(f"{cached_idx=}")
+                print(f"{cached_keys.shape=}")
+                print(f"{key_states.shape=}")
+                print(f"{query_states.shape[2] * 128 * 4=}")
+                self.initial = False
         keys = torch.cat(
-            cached_keys + [keys],
+            [cached_keys, keys],
             dim=2,
         )
         values = torch.cat(
-            cached_values + [values],
+            [cached_values, values],
             dim=2,
         )
 
