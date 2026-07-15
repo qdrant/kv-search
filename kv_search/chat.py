@@ -6,7 +6,13 @@ import numpy as np
 import rich
 import torch
 from qdrant_client import QdrantClient
-from qdrant_client.models import Batch, Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Batch,
+    Distance,
+    PointStruct,
+    VectorParams,
+    HnswConfigDiff,
+)
 from rich.progress import track
 from safetensors.torch import load, save
 from transformers import (
@@ -29,7 +35,13 @@ from transformers import (
 from transformers.cache_utils import CacheLayerMixin
 
 from kv_search.data import Datasets, Message, load_dataset
-from kv_search.query_aware_cache import QdrantCache, bind_query_aware_cache, CutoffCache
+from kv_search.query_aware_cache import (
+    QdrantCache,
+    bind_query_aware_cache,
+    CutoffCache,
+    CacheState,
+    LayerState,
+)
 
 IS_MULTIMODAL = {
     "Qwen/Qwen3.5-9B",
@@ -58,29 +70,36 @@ client = QdrantClient("localhost")
 
 
 def upsert():
-    for i in track(range(8), transient=True, description="Layers"):
-        with compression.zstd.open(
-            f"cache/qdrant/qwen3_5/layer_{i}_tensors.safetensors.zst",
-            "rb",
-        ) as f:
-            tensors: dict[str, torch.Tensor] = load(f.read())
+    state = CacheState.load(Path(f"cache/qdrant/qwen3_5/"))
+    for layer in track(state.layers, transient=True, description="Layers"):
+        if not isinstance(layer, LayerState):
+            continue
 
         for h in track(range(4), transient=True, description="Heads"):
-            if client.collection_exists(f"layer={i};head={h}"):
-                client.delete_collection(f"layer={i};head={h}")
+            if client.collection_exists(f"layer={layer.idx};head={h}"):
+                client.delete_collection(f"layer={layer.idx};head={h}")
 
             client.create_collection(
-                collection_name=f"layer={i};head={h}",
-                vectors_config=VectorParams(
-                    size=tensors["keys"].shape[-1], distance=Distance.COSINE
-                ),
+                collection_name=f"layer={layer.idx};head={h}",
+                vectors_config={
+                    "key": VectorParams(
+                        size=layer.keys.shape[-1], distance=Distance.DOT
+                    ),
+                    "value": VectorParams(
+                        size=layer.keys.shape[-1],
+                        distance=Distance.DOT,
+                        hnsw_config=HnswConfigDiff(m=0),
+                    ),
+                },
             )
 
-            length: int = tensors["prefill_length"]
-
-            ids = torch.split(torch.arange(length, dtype=torch.int), 128)
-            keys = torch.split(tensors["keys"][0, h, :length].to(torch.float), 128)
-            values = torch.split(tensors["values"][0, h, :length].to(torch.float), 128)
+            ids = torch.split(torch.arange(state.context_len, dtype=torch.int), 128)
+            keys = torch.split(
+                layer.keys[0, h, : state.context_len].to(torch.float), 128
+            )
+            values = torch.split(
+                layer.values[0, h, : state.context_len].to(torch.float), 128
+            )
 
             for idx, k, v in track(
                 zip(ids, keys, values),
@@ -89,11 +108,13 @@ def upsert():
                 description="Batch",
             ):
                 client.upsert(
-                    collection_name=f"layer={i};head={h}",
+                    collection_name=f"layer={layer.idx};head={h}",
                     points=Batch(
                         ids=idx.tolist(),
-                        vectors=k.numpy(),
-                        payloads=[{"value": t} for t in v.tolist()],
+                        vectors={
+                            "key": k.numpy(),
+                            "value": v.numpy(),
+                        },
                     ),
                 )
 
@@ -126,9 +147,9 @@ def main(
                 attn_implementation="sdpa",
                 dtype=torch.bfloat16,
             )
-            .cuda()
+            .cuda()  # ty:ignore[missing-argument]
             .eval()
-        )  # ty:ignore[missing-argument]
+        )
 
     bind_query_aware_cache(model)
     # past_key_values = QdrantCache("localhost", config=model.config)
