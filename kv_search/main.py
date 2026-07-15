@@ -1,11 +1,9 @@
-import compression.zstd
 from pathlib import Path
 from typing import Literal
 
 import rich
 import torch
 from rich.progress import track
-from safetensors.torch import save
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForMultimodalLM,
@@ -23,10 +21,16 @@ from transformers import (
     Qwen3VLProcessor,
     TextStreamer,
 )
-from transformers.cache_utils import CacheLayerMixin
+from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
 from kv_search.data import Datasets, Message, load_dataset
-from kv_search.query_aware_cache import QueryAwareCache, bind_query_aware_cache
+from kv_search.query_aware_cache import (
+    CacheState,
+    LayerState,
+    LinearLayerState,
+    QueryAwareCache,
+    bind_query_aware_cache,
+)
 
 IS_MULTIMODAL = {
     "Qwen/Qwen3.5-9B",
@@ -114,17 +118,25 @@ def main(
 ):
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
     if model_name in IS_MULTIMODAL:
-        model: ModelType = AutoModelForMultimodalLM.from_pretrained(
-            model_name,
-            attn_implementation="sdpa",
-            dtype=torch.bfloat16,
-        ).cuda().eval()
+        model: ModelType = (
+            AutoModelForMultimodalLM.from_pretrained(
+                model_name,
+                attn_implementation="sdpa",
+                dtype=torch.bfloat16,
+            )
+            .cuda()
+            .eval()
+        )
     else:
-        model: ModelType = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            attn_implementation="sdpa",
-            dtype=torch.bfloat16,
-        ).cuda().eval()  # ty:ignore[missing-argument]
+        model: ModelType = (
+            AutoModelForCausalLM.from_pretrained(
+                model_name,
+                attn_implementation="sdpa",
+                dtype=torch.bfloat16,
+            )
+            .cuda()
+            .eval()
+        )  # ty:ignore[missing-argument]
 
     bind_query_aware_cache(model)
     past_key_values = QueryAwareCache(config=model.config)
@@ -166,27 +178,31 @@ def main(
     print(processor.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
     print(f"{past_key_values.get_seq_length()=}")
 
-    tensors = [
-        {
-            "prefill_length": torch.tensor(prefill_length),
-            "queries": past_key_values.queries[i],
-            "keys": past_key_values.layers[i].keys,
-            "values": past_key_values.layers[i].values,
-        }
-        for i in range(len(past_key_values.layers))
-        if isinstance(past_key_values.layers[i], CacheLayerMixin)
-    ]
+    state = CacheState(context_len=prefill_length, layers=[])
+    for i, layer in past_key_values.layers:
+        match layer:
+            case CacheLayerMixin(keys=keys, values=values):
+                state.layers.append(
+                    LayerState(
+                        idx=i,
+                        queries=past_key_values.queries[i],
+                        keys=keys,
+                        values=values,
+                    )
+                )
+            case LinearAttentionCacheLayerMixin(
+                conv_states=conv_states, recurrent_states=rec_states
+            ):
+                state.layers.append(
+                    LinearLayerState(
+                        idx=i, conv_states=conv_states, rec_states=rec_states
+                    )
+                )
 
-    Path(f"cache/{dataset_name}/{model.config.model_type}").mkdir(
-        exist_ok=True, parents=True
-    )
+    cache_dir = Path(f"cache/{dataset_name}/{model.config.model_type}")
+    cache_dir.mkdir(exist_ok=True, parents=True)
 
-    for i, tensor_dict in enumerate(tensors):
-        with compression.zstd.open(
-            f"cache/{dataset_name}/{model.config.model_type}/layer_{i}_tensors.safetensors.zst",
-            "wb",
-        ) as f:
-            f.write(save(tensor_dict))
+    state.save(cache_dir)
 
 
 if __name__ == "__main__":

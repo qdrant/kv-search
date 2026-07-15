@@ -1,43 +1,96 @@
-from qdrant_client.models import SearchParams, QueryRequest
+import compression.zstd
 import types
+from pathlib import Path
 from typing import Callable, Unpack
 
 import torch
+from pydantic import BaseModel, Field, TypeAdapter
+from qdrant_client import QdrantClient
+from qdrant_client.models import QueryRequest, SearchParams
+from safetensors.torch import load, save
 from transformers import DynamicCache
-from transformers.cache_utils import Cache
+from transformers.cache_utils import (
+    Cache,
+    CacheLayerMixin,
+    LinearAttentionCacheLayerMixin,
+)
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
-from transformers.models.ministral3.modeling_ministral3 import Ministral3Attention
 from transformers.models.gemma3.modeling_gemma3 import Gemma3Attention
 from transformers.models.gemma4_unified.modeling_gemma4_unified import (
     Gemma4UnifiedTextAttention,
 )
-from qdrant_client import QdrantClient
-import compression.zstd
-from safetensors.torch import load
+from transformers.models.ministral3.modeling_ministral3 import Ministral3Attention
+from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
+
+
+class LinearLayerState(BaseModel):
+    idx: int
+    conv_states: torch.Tensor
+    rec_states: torch.Tensor
+
+
+class LayerState(BaseModel):
+    idx: int
+    queries: torch.Tensor
+    keys: torch.Tensor
+    values: torch.Tensor
+
+
+LayerAdapter: TypeAdapter[LayerState | LinearLayerState] = TypeAdapter(
+    LayerState | LinearLayerState
+)
+
+
+class CacheState(BaseModel):
+    context_len: int
+    layers: list[LayerState | LinearLayerState] = Field(default_factory=list)
+
+    def save(self, path: Path):
+        with (path / "meta.json").open("wt") as f:
+            f.write(self.model_dump_json(exclude={"layers"}))
+        for layer in self.layers:
+            with compression.zstd.open(
+                path / f"layer_{layer.idx:02d}_tensors.safetensors.zst", "wb"
+            ) as f:
+                tmp = layer.model_dump()
+                tmp["idx"] = torch.tensor(tmp["idx"], dtype=torch.long)
+                f.write(save(tmp))
+
+    @classmethod
+    def load(cls, path: Path) -> CacheState:
+        with (path / "meta.json").open("rt") as f:
+            ret = cls.model_validate_json(f.read())
+
+        for p in sorted(list(path.glob("layer_*_tensors.safetensors.zst"))):
+            with compression.zstd.open(p, "rb") as f:
+                tmp = load(f.read())
+                tmp["idx"] = tmp["idx"].item()  # ty:ignore[invalid-assignment]
+                ret.layers.append(LayerAdapter.validate_python(tmp))
+
+        return ret
 
 
 class CutoffCache(DynamicCache):
     cutoff: int | None
+    state: CacheState
+    layers: list[CacheLayerMixin | LinearAttentionCacheLayerMixin]
 
     def __init__(self, cutoff: int | None = None, **kwargs):
         super().__init__(**kwargs)
         self.cutoff = cutoff
 
-        self.prefill_keys: dict[int, torch.Tensor] = {}
-        self.prefill_values: dict[int, torch.Tensor] = {}
         self.scaling = 256**-0.5
 
-        for i in range(8):
-            with compression.zstd.open(
-                f"cache/qdrant/qwen3_5/layer_{i}_tensors.safetensors.zst",
-                "rb",
-            ) as f:
-                tensors = load(f.read())
-                length = tensors["prefill_length"]
-                self.prefill_keys[i * 4 + 3] = tensors["keys"][:, :, :length, :]
-                self.prefill_values[i * 4 + 3] = tensors["values"][:, :, :length, :]
+        self.state = CacheState.load(Path(f"cache/qdrant/qwen3_5/"))
+
+        assert len(self.state.layers) == len(self.layers)
+        for cached_layer, layer in zip(self.state.layers, self.layers):
+            if isinstance(cached_layer, LinearLayerState):
+                assert isinstance(layer, LinearAttentionCacheLayerMixin)
+                layer.lazy_initialization(
+                    cached_layer.conv_states, cached_layer.rec_states
+                )
 
     def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
@@ -79,19 +132,20 @@ class CutoffCache(DynamicCache):
 
     def update(
         self,
-        key_states,
-        value_states,
-        layer_idx,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
         *args,
         query_states: torch.Tensor | None = None,
         **kwargs,
     ):
-        self.prefill_keys[layer_idx] = self.prefill_keys[layer_idx].to(
-            key_states.device
-        )
-        self.prefill_values[layer_idx] = self.prefill_values[layer_idx].to(
-            key_states.device
-        )
+        layer_state = self.state.layers[layer_idx]
+        assert isinstance(layer_state, LayerState)
+        layer_state.keys = layer_state.keys.to(key_states.device)
+        layer_state.values = layer_state.values.to(value_states.device)
+
+        cache_keys = layer_state.keys[:, :, : self.state.context_len, :]
+        cache_values = layer_state.values[:, :, : self.state.context_len, :]
 
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
@@ -99,12 +153,12 @@ class CutoffCache(DynamicCache):
 
         if query_states is not None:
             if self.cutoff is None:
-                return torch.cat(
-                    [self.prefill_keys[layer_idx], keys], dim=2
-                ), torch.cat([self.prefill_values[layer_idx], values], dim=2)
+                return torch.cat([cache_keys, keys], dim=2), torch.cat(
+                    [cache_values, values], dim=2
+                )
 
             s = self.eager_attention_forward(
-                query_states, self.prefill_keys[layer_idx], scaling=self.scaling
+                query_states, cache_keys, scaling=self.scaling
             )
             # print(f"{self.cutoff=}")
             # print(f"{s.shape=}")
@@ -112,11 +166,9 @@ class CutoffCache(DynamicCache):
             idx, _ = idx.reshape((1, 4, -1, 1)).sort(dim=2)
             # idx = idx.to(keys.device)
 
-            keys = torch.cat(
-                [self.prefill_keys[layer_idx].take_along_dim(idx, dim=2), keys], dim=2
-            )
+            keys = torch.cat([cache_keys.take_along_dim(idx, dim=2), keys], dim=2)
             values = torch.cat(
-                [self.prefill_values[layer_idx].take_along_dim(idx, dim=2), values],
+                [cache_values.take_along_dim(idx, dim=2), values],
                 dim=2,
             )
 
