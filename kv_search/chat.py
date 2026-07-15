@@ -1,47 +1,55 @@
-import compression.zstd
+import contextlib
+import io
+import os
+
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+
 from pathlib import Path
 from typing import Literal
 
-import numpy as np
-import rich
 import torch
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Batch,
     Distance,
-    PointStruct,
-    VectorParams,
     HnswConfigDiff,
+    VectorParams,
 )
 from rich.progress import track
-from safetensors.torch import load, save
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForMultimodalLM,
-    AutoProcessor,
-    BatchEncoding,
-    Gemma3ForConditionalGeneration,
-    Gemma3Processor,
-    Gemma4ForConditionalGeneration,
-    Gemma4Processor,
-    Mistral3ForConditionalGeneration,
-    PixtralProcessor,
-    Qwen2ForCausalLM,
-    Qwen2Tokenizer,
-    Qwen3_5ForConditionalGeneration,
-    Qwen3VLProcessor,
-    TextStreamer,
-)
-from transformers.cache_utils import CacheLayerMixin
+from rich.prompt import Prompt
 
-from kv_search.data import Datasets, Message, load_dataset
-from kv_search.query_aware_cache import (
-    QdrantCache,
-    bind_query_aware_cache,
-    CutoffCache,
-    CacheState,
-    LayerState,
-)
+import transformers.utils.logging
+
+transformers.utils.logging.set_verbosity(transformers.utils.logging.CRITICAL)
+
+# auto_docstring emits [ERROR] lines via print() at class-definition time
+with contextlib.redirect_stdout(io.StringIO()):
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoModelForMultimodalLM,
+        AutoProcessor,
+        BatchEncoding,
+        Gemma3ForConditionalGeneration,
+        Gemma3Processor,
+        Gemma4ForConditionalGeneration,
+        Gemma4Processor,
+        Mistral3ForConditionalGeneration,
+        PixtralProcessor,
+        Qwen2ForCausalLM,
+        Qwen2Tokenizer,
+        Qwen3_5ForConditionalGeneration,
+        Qwen3VLProcessor,
+        TextStreamer,
+    )
+
+    from kv_search.data import Datasets, Message, load_dataset
+    from kv_search.query_aware_cache import (
+        CacheState,
+        CutoffCache,
+        LayerState,
+        QdrantCache,
+        bind_query_aware_cache,
+    )
 
 IS_MULTIMODAL = {
     "Qwen/Qwen3.5-9B",
@@ -157,24 +165,17 @@ def main(
 
     streamer = TextStreamer(processor.tokenizer)
 
-    messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
-
-    rich.print(messages.query)
+    # messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
+    # rich.print(messages.query)
+    user = input("> ")
     inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
-        messages.query,
+        [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
         add_generation_prompt=True,
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
         enable_thinking=False,
     )  # ty:ignore[invalid-assignment]
-    inputs["attention_mask"] = torch.cat(
-        [
-            torch.ones(1, past_key_values.get_seq_length(), dtype=torch.long),
-            inputs["attention_mask"],
-        ],
-        dim=1,
-    )
     inputs = inputs.to(model.device)
 
     model.generate(
