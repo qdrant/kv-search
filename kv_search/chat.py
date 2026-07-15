@@ -155,7 +155,7 @@ def main(
     )
     inputs = inputs.to(model.device)
 
-    outputs = model.generate(
+    model.generate(
         **inputs,  # ty:ignore[invalid-argument-type]
         max_new_tokens=256,
         past_key_values=past_key_values,

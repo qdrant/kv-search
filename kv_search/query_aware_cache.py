@@ -57,22 +57,22 @@ class QdrantCache(DynamicCache):
                         collection_name=f"layer={(layer_idx - 3)//4};head={head_idx}",
                         requests=[
                             QueryRequest(
-                                query=query_states[0, query_idx + i, 0]
+                                query=query_states[0, query_idx + i, token_idx]
                                 .cpu()
                                 .to(torch.float)
                                 .numpy(),
                                 params=SearchParams(exact=True),
                                 with_payload=True,
                                 with_vector=True,
-                                limit=256,
+                                limit=4096,
                             )
                             for i in range(4)
                         ],
                     )
                     cached_key_head: list[list[float]] = []
                     cached_value_head: list[list[float]] = []
-                    for q in data:
-                        for p in q.points:
+                    for r in data:
+                        for p in r.points:
                             cached_key_head.append(p.vector)
                             cached_value_head.append(p.payload["value"])
                     cached_key_per_token.append(
