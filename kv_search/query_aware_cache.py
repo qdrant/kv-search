@@ -87,6 +87,7 @@ class CutoffCache(DynamicCache):
     def __init__(self, cutoff: int | None = None, **kwargs):
         super().__init__(**kwargs)
         self.cutoff = cutoff
+        self.initial = True
 
         self.scaling = 256**-0.5
 
@@ -97,7 +98,7 @@ class CutoffCache(DynamicCache):
             if isinstance(cached_layer, LinearLayerState):
                 assert isinstance(layer, LinearAttentionCacheLayerMixin)
                 layer.lazy_initialization(
-                    cached_layer.conv_states, cached_layer.rec_states
+                    cached_layer.conv_states.cuda(), cached_layer.rec_states.cuda()
                 )
 
     def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -179,6 +180,14 @@ class CutoffCache(DynamicCache):
                 [cache_values.take_along_dim(idx, dim=2), values],
                 dim=2,
             )
+
+            if self.initial:
+                print(f"{idx.shape=}")
+                print(f"{idx=}")
+                print(f"{keys.shape=}")
+                print(f"{key_states.shape=}")
+                print(f"{query_states.shape[2] * 128 * 4=}")
+                self.initial = False
 
         return keys, values
 
