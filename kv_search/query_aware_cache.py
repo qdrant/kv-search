@@ -14,6 +14,99 @@ from transformers.models.gemma4_unified.modeling_gemma4_unified import (
     Gemma4UnifiedTextAttention,
 )
 from qdrant_client import QdrantClient
+import compression.zstd
+from safetensors.torch import load
+
+
+class CutoffCache(DynamicCache):
+    cutoff: int | None
+
+    def __init__(self, cutoff: int | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.cutoff = cutoff
+
+        self.prefill_keys: dict[int, torch.Tensor] = {}
+        self.prefill_values: dict[int, torch.Tensor] = {}
+
+        for i in range(8):
+            with compression.zstd.open(
+                f"cache/qdrant/qwen3_5/layer_{i}_tensors.safetensors.zst",
+                "rb",
+            ) as f:
+                tensors = load(f.read())
+                length = tensors["prefill_length"]
+                self.prefill_keys[i * 4 + 3] = tensors["keys"][:, :, :length, :]
+                self.prefill_values[i * 4 + 3] = tensors["values"][:, :, :length, :]
+
+    def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        """
+        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+        """
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(
+            batch, num_key_value_heads, n_rep, slen, head_dim
+        )
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+    def _eager_attention_forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        scaling: float,
+        attention_mask: torch.Tensor | None = None,
+        softcap: float | None = None,
+    ) -> torch.Tensor:
+        key_states = self.repeat_kv(key, 4)
+
+        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+
+        if softcap is not None:
+            attn_weights = attn_weights / softcap
+            attn_weights = torch.tanh(attn_weights)
+            attn_weights = attn_weights * softcap
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        return attn_weights
+
+    def update(
+        self,
+        key_states,
+        value_states,
+        layer_idx,
+        *args,
+        query_states: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        keys, values = super().update(
+            key_states, value_states, layer_idx, *args, **kwargs
+        )
+
+        if query_states is not None:
+            if self.cutoff is None:
+                return torch.cat(
+                    [self.prefill_keys[layer_idx], keys], dim=2
+                ), torch.cat([self.prefill_values[layer_idx], values], dim=2)
+
+
+            s = self.eager_attention_forward(
+                query_states, self.prefill_keys[layer_idx]#, scaling=
+            )
+            _, idx = torch.topk(s, self.cutoff, dim=2)
+            idx = idx.sort(dim=2)
+
+            keys = torch.cat([
+                self.prefill_keys[layer_idx].take_along_dim(idx, dim=2), keys
+            ], dim=2)
+            values = torch.cat([
+                self.prefill_values[layer_idx].take_along_dim(idx, dim=2), values
+            ], dim=2)
+
+        return keys, values
 
 
 class QdrantCache(DynamicCache):
@@ -54,7 +147,7 @@ class QdrantCache(DynamicCache):
                 for head_idx in range(key_states.shape[1]):
                     query_idx = head_idx * 4
                     data = self.client.query_batch_points(
-                        collection_name=f"layer={(layer_idx - 3)//4};head={head_idx}",
+                        collection_name=f"layer={(layer_idx - 3) // 4};head={head_idx}",
                         requests=[
                             QueryRequest(
                                 query=query_states[0, query_idx + i, token_idx]

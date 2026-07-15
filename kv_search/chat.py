@@ -29,7 +29,7 @@ from transformers import (
 from transformers.cache_utils import CacheLayerMixin
 
 from kv_search.data import Datasets, Message, load_dataset
-from kv_search.query_aware_cache import QdrantCache, bind_query_aware_cache
+from kv_search.query_aware_cache import QdrantCache, bind_query_aware_cache, CutoffCache
 
 IS_MULTIMODAL = {
     "Qwen/Qwen3.5-9B",
@@ -131,7 +131,8 @@ def main(
         )  # ty:ignore[missing-argument]
 
     bind_query_aware_cache(model)
-    past_key_values = QdrantCache("localhost", config=model.config)
+    # past_key_values = QdrantCache("localhost", config=model.config)
+    past_key_values = CutoffCache(1024, config=model.config)
 
     streamer = TextStreamer(processor.tokenizer)
 
