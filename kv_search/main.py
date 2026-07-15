@@ -179,7 +179,7 @@ def main(
     print(f"{past_key_values.get_seq_length()=}")
 
     state = CacheState(context_len=prefill_length, layers=[])
-    for i, layer in past_key_values.layers:
+    for i, layer in enumerate(past_key_values.layers):
         match layer:
             case CacheLayerMixin(keys=keys, values=values):
                 state.layers.append(

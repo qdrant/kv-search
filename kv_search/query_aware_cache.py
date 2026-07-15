@@ -24,17 +24,25 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
 
-class LinearLayerState(BaseModel):
+class LinearLayerState(BaseModel, arbitrary_types_allowed=True):
     idx: int
     conv_states: torch.Tensor
     rec_states: torch.Tensor
 
+    def contiguous(self):
+        self.conv_states = self.conv_states.contiguous()
+        self.rec_states = self.rec_states.contiguous()
+        return self
 
-class LayerState(BaseModel):
+
+class LayerState(BaseModel, arbitrary_types_allowed=True):
     idx: int
     queries: torch.Tensor
     keys: torch.Tensor
     values: torch.Tensor
+
+    def contiguous(self):
+        return self
 
 
 LayerAdapter: TypeAdapter[LayerState | LinearLayerState] = TypeAdapter(
@@ -42,7 +50,7 @@ LayerAdapter: TypeAdapter[LayerState | LinearLayerState] = TypeAdapter(
 )
 
 
-class CacheState(BaseModel):
+class CacheState(BaseModel, arbitrary_types_allowed=True):
     context_len: int
     layers: list[LayerState | LinearLayerState] = Field(default_factory=list)
 
@@ -53,7 +61,7 @@ class CacheState(BaseModel):
             with compression.zstd.open(
                 path / f"layer_{layer.idx:02d}_tensors.safetensors.zst", "wb"
             ) as f:
-                tmp = layer.model_dump()
+                tmp = layer.contiguous().model_dump()
                 tmp["idx"] = torch.tensor(tmp["idx"], dtype=torch.long)
                 f.write(save(tmp))
 
@@ -289,21 +297,21 @@ class QueryAwareCache(DynamicCache):
                 )
 
         # Bring current layer back to GPU if offloaded
-        if layer_idx < len(self.layers):
-            layer = self.layers[layer_idx]
-            if layer.is_initialized and layer.keys.device != key_states.device:
-                layer.keys = layer.keys.to(key_states.device)
-                layer.values = layer.values.to(key_states.device)
+        # if layer_idx < len(self.layers):
+        #     layer = self.layers[layer_idx]
+        #     if layer.is_initialized and layer.keys.device != key_states.device:
+        #         layer.keys = layer.keys.to(key_states.device)
+        #         layer.values = layer.values.to(key_states.device)
 
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
         )
 
-        layer = self.layers[layer_idx]
+        # layer = self.layers[layer_idx]
 
-        # Offload to CPU after update
-        layer.keys = layer.keys.to("cpu")
-        layer.values = layer.values.to("cpu")
+        # # Offload to CPU after update
+        # layer.keys = layer.keys.to("cpu")
+        # layer.values = layer.values.to("cpu")
 
         return keys, values
 
