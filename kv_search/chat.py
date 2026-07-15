@@ -152,8 +152,8 @@ def main(
         )
 
     bind_query_aware_cache(model)
-    # past_key_values = QdrantCache("localhost", config=model.config)
-    past_key_values = CutoffCache(128, config=model.config)
+    past_key_values = QdrantCache("localhost", config=model.config)
+    # past_key_values = CutoffCache(128, config=model.config)
 
     streamer = TextStreamer(processor.tokenizer)
 

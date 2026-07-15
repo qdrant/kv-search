@@ -208,6 +208,16 @@ class QdrantCache(DynamicCache):
         self.client = QdrantClient(url)
         self.initial = True
 
+        state = CacheState.load(Path(f"cache/qdrant/qwen3_5/"))
+
+        assert len(state.layers) == len(self.layers)
+        for cached_layer, layer in zip(state.layers, self.layers):
+            if isinstance(cached_layer, LinearLayerState):
+                assert isinstance(layer, LinearAttentionCacheLayerMixin)
+                layer.lazy_initialization(
+                    cached_layer.conv_states.cuda(), cached_layer.rec_states.cuda()
+                )
+
     def update(
         self,
         key_states: torch.Tensor,
@@ -229,7 +239,7 @@ class QdrantCache(DynamicCache):
             for head_idx in range(key_states.shape[1]):
                 query_idx = head_idx * 4
                 data = self.client.query_batch_points(
-                    collection_name=f"layer={(layer_idx - 3) // 4};head={head_idx}",
+                    collection_name=f"layer={layer_idx};head={head_idx}",
                     requests=[
                         QueryRequest(
                             query=query_states[0, query_idx + i, token_idx]
@@ -239,6 +249,7 @@ class QdrantCache(DynamicCache):
                             params=SearchParams(exact=True),
                             with_payload=True,
                             with_vector=True,
+                            using="key",
                             limit=128,
                         )
                         for token_idx in range(query_states.shape[2])
@@ -281,9 +292,10 @@ class QdrantCache(DynamicCache):
             cached_values = torch.cat(cached_values_per_head, dim=1)
             cached_idx = torch.cat(cached_idx_per_head, dim=1)
             sorted_idx = cached_idx.argsort(dim=2)
+            cached_idx = cached_idx.take_along_dim(sorted_idx, dim=2)
+            sorted_idx = sorted_idx.unsqueeze(-1)
             cached_keys = cached_keys.take_along_dim(sorted_idx, dim=2)
             cached_values = cached_values.take_along_dim(sorted_idx, dim=2)
-            cached_idx = cached_idx.take_along_dim(sorted_idx, dim=2)
             if self.initial:
                 print(f"{cached_idx.shape=}")
                 print(f"{cached_idx=}")
