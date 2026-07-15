@@ -39,7 +39,7 @@ class CutoffCache(DynamicCache):
                 self.prefill_keys[i * 4 + 3] = tensors["keys"][:, :, :length, :]
                 self.prefill_values[i * 4 + 3] = tensors["values"][:, :, :length, :]
 
-    def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
         This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
         num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
@@ -52,8 +52,7 @@ class CutoffCache(DynamicCache):
         )
         return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-
-    def _eager_attention_forward(
+    def eager_attention_forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -72,6 +71,10 @@ class CutoffCache(DynamicCache):
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
 
+        # attn_weights = torch.nn.functional.softmax(
+        #     attn_weights, dim=-1, dtype=torch.float32
+        # ).to(query.dtype)
+
         return attn_weights
 
     def update(
@@ -83,6 +86,13 @@ class CutoffCache(DynamicCache):
         query_states: torch.Tensor | None = None,
         **kwargs,
     ):
+        self.prefill_keys[layer_idx] = self.prefill_keys[layer_idx].to(
+            key_states.device
+        )
+        self.prefill_values[layer_idx] = self.prefill_values[layer_idx].to(
+            key_states.device
+        )
+
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
         )
@@ -93,19 +103,22 @@ class CutoffCache(DynamicCache):
                     [self.prefill_keys[layer_idx], keys], dim=2
                 ), torch.cat([self.prefill_values[layer_idx], values], dim=2)
 
-
             s = self.eager_attention_forward(
                 query_states, self.prefill_keys[layer_idx], scaling=self.scaling
             )
-            _, idx = torch.topk(s, self.cutoff, dim=2)
-            idx = idx.sort(dim=2)
+            # print(f"{self.cutoff=}")
+            # print(f"{s.shape=}")
+            _, idx = torch.topk(s, self.cutoff, dim=-1)
+            idx, _ = idx.reshape((1, 4, -1, 1)).sort(dim=2)
+            # idx = idx.to(keys.device)
 
-            keys = torch.cat([
-                self.prefill_keys[layer_idx].take_along_dim(idx, dim=2), keys
-            ], dim=2)
-            values = torch.cat([
-                self.prefill_values[layer_idx].take_along_dim(idx, dim=2), values
-            ], dim=2)
+            keys = torch.cat(
+                [self.prefill_keys[layer_idx].take_along_dim(idx, dim=2), keys], dim=2
+            )
+            values = torch.cat(
+                [self.prefill_values[layer_idx].take_along_dim(idx, dim=2), values],
+                dim=2,
+            )
 
         return keys, values
 
