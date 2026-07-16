@@ -211,12 +211,10 @@ class QdrantCache(DynamicCache):
         self.state = CacheState.load(Path(f"cache/qdrant/qwen3_5/"))
 
         assert len(self.state.layers) == len(self.layers)
-        for cached_layer, layer in zip(self.state.layers, self.layers):
+        for cached_layer in self.state.layers:
             if isinstance(cached_layer, LinearLayerState):
-                assert isinstance(layer, LinearAttentionCacheLayerMixin)
-                layer.lazy_initialization(
-                    cached_layer.conv_states.cuda(), cached_layer.rec_states.cuda()
-                )
+                cached_layer.conv_states = cached_layer.conv_states.cuda()
+                cached_layer.rec_states = cached_layer.rec_states.cuda()
             else:
                 cached_layer.keys = torch.tensor(
                     [], dtype=cached_layer.keys.dtype, device=cached_layer.keys.device
@@ -226,15 +224,33 @@ class QdrantCache(DynamicCache):
                     dtype=cached_layer.values.dtype,
                     device=cached_layer.values.device,
                 )
+        self._restore_state()
 
-    def reset(self):
-        super().reset()
+    def _restore_state(self):
         for cached_layer, layer in zip(self.state.layers, self.layers):
             if isinstance(cached_layer, LinearLayerState):
                 assert isinstance(layer, LinearAttentionCacheLayerMixin)
-                layer.lazy_initialization(
-                    cached_layer.conv_states.cuda(), cached_layer.rec_states.cuda()
+                if not (
+                    layer.is_conv_states_initialized
+                    and layer.is_recurrent_states_initialized
+                ):
+                    layer.lazy_initialization(
+                        cached_layer.conv_states, cached_layer.rec_states
+                    )
+                layer.conv_states.copy_(cached_layer.conv_states)
+                layer.recurrent_states.copy_(cached_layer.rec_states)
+                layer.has_previous_state = True
+            elif layer.is_initialized:
+                layer.keys = torch.tensor(
+                    [], dtype=layer.keys.dtype, device=layer.keys.device
                 )
+                layer.values = torch.tensor(
+                    [], dtype=layer.values.dtype, device=layer.values.device
+                )
+
+    def reset(self):
+        super().reset()
+        self._restore_state()
 
     def update(
         self,
