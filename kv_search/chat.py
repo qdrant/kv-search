@@ -180,6 +180,13 @@ def main(
         )  # ty:ignore[invalid-assignment]
         inputs = inputs.to(model.device)
 
+        # offset positional embeddings to beyond prefill content
+        context_len = past_key_values.state.context_len
+        prompt_len = inputs["input_ids"].shape[1]
+        inputs["position_ids"] = torch.arange(
+            context_len, context_len + prompt_len, device=model.device
+        ).unsqueeze(0)
+
         model.generate(
             **inputs,  # ty:ignore[invalid-argument-type]
             max_new_tokens=256,

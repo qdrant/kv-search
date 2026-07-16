@@ -276,7 +276,7 @@ class QdrantCache(DynamicCache):
                 )
                 cached_key_head: list[list[float]] = []
                 cached_value_head: list[list[float]] = []
-                cached_idx_head: list[int] = []
+                # cached_idx_head: list[int] = []
                 for r in data:
                     for p in r.points:
                         assert isinstance(p.vector, dict)
@@ -284,12 +284,12 @@ class QdrantCache(DynamicCache):
                         assert "value" in p.vector
                         cached_key_head.append(p.vector["key"])
                         cached_value_head.append(p.vector["value"])
-                        cached_idx_head.append(p.id)
-                cached_idx_per_head.append(
-                    torch.tensor(cached_idx_head, dtype=torch.long, device=keys.device)
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                )
+                        # cached_idx_head.append(p.id)
+                # cached_idx_per_head.append(
+                #     torch.tensor(cached_idx_head, dtype=torch.long, device=keys.device)
+                #     .unsqueeze(0)
+                #     .unsqueeze(0)
+                # )
                 cached_keys_per_head.append(
                     torch.tensor(cached_key_head, dtype=keys.dtype, device=keys.device)
                     .unsqueeze(0)
@@ -304,19 +304,7 @@ class QdrantCache(DynamicCache):
                 )
             cached_keys = torch.cat(cached_keys_per_head, dim=1)
             cached_values = torch.cat(cached_values_per_head, dim=1)
-            cached_idx = torch.cat(cached_idx_per_head, dim=1)
-            sorted_idx = cached_idx.argsort(dim=2)
-            # cached_idx = cached_idx.take_along_dim(sorted_idx, dim=2)
-            sorted_idx = sorted_idx.unsqueeze(-1)
-            cached_keys = cached_keys.take_along_dim(sorted_idx, dim=2)
-            cached_values = cached_values.take_along_dim(sorted_idx, dim=2)
-            # if self.initial:
-            #     print(f"{cached_idx.shape=}")
-            #     print(f"{cached_idx=}")
-            #     print(f"{cached_keys.shape=}")
-            #     print(f"{key_states.shape=}")
-            #     print(f"{query_states.shape[2] * 128 * 4=}")
-            #     self.initial = False
+            # cached_idx = torch.cat(cached_idx_per_head, dim=1)
         keys = torch.cat(
             [cached_keys, keys],
             dim=2,
@@ -411,6 +399,21 @@ def _qwen_3_5_forward(
         key_states, value_states = past_key_values.update(
             key_states, value_states, self.layer_idx, query_states=query_states
         )
+
+    q_len, k_len = query_states.shape[2], key_states.shape[2]
+    if attention_mask is None and q_len > 1:
+        attention_mask = torch.zeros(
+            q_len, k_len, dtype=query_states.dtype, device=query_states.device
+        )
+        attention_mask[:, k_len - q_len :] = torch.triu(
+            torch.full(
+                (q_len, q_len),
+                torch.finfo(query_states.dtype).min,
+                device=query_states.device,
+            ),
+            diagonal=1,
+        )
+        attention_mask = attention_mask[None, None]
 
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, eager_attention_forward
