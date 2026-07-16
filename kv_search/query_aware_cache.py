@@ -94,12 +94,37 @@ class CutoffCache(DynamicCache):
         self.state = CacheState.load(Path(f"cache/qdrant/qwen3_5/"))
 
         assert len(self.state.layers) == len(self.layers)
+        for cached_layer in self.state.layers:
+            if isinstance(cached_layer, LinearLayerState):
+                cached_layer.conv_states = cached_layer.conv_states.cuda()
+                cached_layer.rec_states = cached_layer.rec_states.cuda()
+        self._restore_state()
+
+    def _restore_state(self):
         for cached_layer, layer in zip(self.state.layers, self.layers):
             if isinstance(cached_layer, LinearLayerState):
                 assert isinstance(layer, LinearAttentionCacheLayerMixin)
-                layer.lazy_initialization(
-                    cached_layer.conv_states.cuda(), cached_layer.rec_states.cuda()
+                if not (
+                    layer.is_conv_states_initialized
+                    and layer.is_recurrent_states_initialized
+                ):
+                    layer.lazy_initialization(
+                        cached_layer.conv_states, cached_layer.rec_states
+                    )
+                layer.conv_states.copy_(cached_layer.conv_states)
+                layer.recurrent_states.copy_(cached_layer.rec_states)
+                layer.has_previous_state = True
+            elif layer.is_initialized:
+                layer.keys = torch.tensor(
+                    [], dtype=layer.keys.dtype, device=layer.keys.device
                 )
+                layer.values = torch.tensor(
+                    [], dtype=layer.values.dtype, device=layer.values.device
+                )
+
+    def reset(self):
+        super().reset()
+        self._restore_state()
 
     def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
@@ -379,6 +404,24 @@ class QueryAwareCache(DynamicCache):
         return keys, values
 
 
+def _make_attention_mask(
+    attention_mask: torch.Tensor | None, q_len: int, k_len: int, dtype, device
+):
+    # Need to dynamically create our attention mask because transformers does not have sane defaults for causal/attention masks during inference
+    # usually this is created beforehand, when the prompt is tokenized, but we don't know the context length then
+    if attention_mask is None and q_len > 1:
+        attention_mask = torch.zeros(q_len, k_len, dtype=dtype, device=device)
+        attention_mask[:, k_len - q_len :] = torch.triu(
+            torch.full(
+                (q_len, q_len),
+                torch.finfo(dtype).min,
+                device=device,
+            ),
+            diagonal=1,
+        )
+        return attention_mask[None, None]
+
+
 def _qwen_3_5_forward(
     self: Qwen3_5Attention,
     hidden_states: torch.Tensor,
@@ -416,20 +459,13 @@ def _qwen_3_5_forward(
             key_states, value_states, self.layer_idx, query_states=query_states
         )
 
-    q_len, k_len = query_states.shape[2], key_states.shape[2]
-    if attention_mask is None and q_len > 1:
-        attention_mask = torch.zeros(
-            q_len, k_len, dtype=query_states.dtype, device=query_states.device
-        )
-        attention_mask[:, k_len - q_len :] = torch.triu(
-            torch.full(
-                (q_len, q_len),
-                torch.finfo(query_states.dtype).min,
-                device=query_states.device,
-            ),
-            diagonal=1,
-        )
-        attention_mask = attention_mask[None, None]
+    attention_mask = _make_attention_mask(
+        attention_mask,
+        query_states.shape[2],
+        key_states.shape[2],
+        query_states.dtype,
+        query_states.device,
+    )
 
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, eager_attention_forward
@@ -480,6 +516,14 @@ def _qwen_2_5_forward(
         key_states, value_states = past_key_values.update(
             key_states, value_states, self.layer_idx, query_states=query_states
         )
+
+    attention_mask = _make_attention_mask(
+        attention_mask,
+        query_states.shape[2],
+        key_states.shape[2],
+        query_states.dtype,
+        query_states.device,
+    )
 
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, eager_attention_forward
@@ -538,6 +582,14 @@ def _ministral3_forward(
             key_states, value_states, self.layer_idx, query_states=query_states
         )
 
+    attention_mask = _make_attention_mask(
+        attention_mask,
+        query_states.shape[2],
+        key_states.shape[2],
+        query_states.dtype,
+        query_states.device,
+    )
+
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, eager_attention_forward
     )
@@ -592,6 +644,14 @@ def _gemma3_forward(
         key_states, value_states = past_key_values.update(
             key_states, value_states, self.layer_idx, query_states=query_states
         )
+
+    attention_mask = _make_attention_mask(
+        attention_mask,
+        query_states.shape[2],
+        key_states.shape[2],
+        query_states.dtype,
+        query_states.device,
+    )
 
     attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation, eager_attention_forward
@@ -666,6 +726,15 @@ def _gemma4_forward(
         key_states, value_states = past_key_values.update(
             key_states, value_states, self.layer_idx, query_states=query_states
         )
+
+    attention_mask = _make_attention_mask(
+        attention_mask,
+        query_states.shape[2],
+        key_states.shape[2],
+        query_states.dtype,
+        query_states.device,
+    )
+
     if self.store_full_length_kv:
         shared_kv_states[self.layer_type] = key_states, value_states
 
