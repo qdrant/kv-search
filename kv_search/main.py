@@ -5,8 +5,8 @@ from typing import Literal
 
 import rich
 import torch
-from pydantic import BaseModel
-from pydantic_settings import CliApp, CliSubCommand
+from pydantic import BaseModel, Field
+from pydantic_settings import CliApp, CliSubCommand, SettingsConfigDict
 from rich.progress import track
 from transformers import (
     AutoModelForCausalLM,
@@ -23,12 +23,17 @@ from transformers import (
     Qwen2Tokenizer,
     Qwen3_5ForConditionalGeneration,
     Qwen3VLProcessor,
+    TextStreamer,
 )
 
 from kv_search.data import Datasets, Message, load_dataset
 from kv_search.query_aware_cache import (
+    QdrantRetriever,
     RecordingCache,
+    RetrievalCache,
+    RetrieverConfig,
     bind_query_aware_cache,
+    load_cache,
     save_cache,
 )
 from kv_search.timer import timers
@@ -193,17 +198,66 @@ class Prefill(BaseModel):
 class Chat(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
-    cache_impl: CacheImpl = CacheImpl.QDRANT
-    n_retrieved: int | None = 128
+    retriever: RetrieverConfig = Field(default_factory=QdrantRetriever)
     max_new_tokens: int = 256
-    qdrant_url: str = "localhost"
-    qdrant_api_key: str | None = None
 
     def cli_cmd(self) -> None:
-        raise NotImplementedError
+        model, processor = _load_model(self.model_name)
+
+        cache_dir = Path(f"cache/{self.dataset_name}/{model.config.model_type}")
+        cache_dir.mkdir(exist_ok=True, parents=True)
+
+        prefill, context_len = load_cache(cache_dir, model.config)
+
+        past_key_values = RetrievalCache(
+            retriever=self.retriever, prefill=prefill, config=model.config
+        )
+
+        streamer = TextStreamer(processor.tokenizer, skip_prompt=True)
+
+        # messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
+        # rich.print(messages.query)
+        while True:
+            user = input("\n> ")
+            print("\n")
+            inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
+                [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+                enable_thinking=False,
+            )  # ty:ignore[invalid-assignment]
+            inputs = inputs.to(model.device)
+
+            # offset positional embeddings to beyond prefill content
+            prompt_len = inputs["input_ids"].shape[1]
+            inputs["position_ids"] = torch.arange(
+                context_len, context_len + prompt_len, device=model.device
+            ).unsqueeze(0)
+
+            model.generate(
+                **inputs,  # ty:ignore[invalid-argument-type]
+                max_new_tokens=self.max_new_tokens,
+                past_key_values=past_key_values,
+                use_cache=True,
+                streamer=streamer,
+            )  # ty:ignore[invalid-argument-type]
+            past_key_values.reset()
 
 
-class KvSearch(BaseModel):
+class KvSearch(
+    BaseModel,
+    cli_shortcuts={
+        "retriever.url": "url",
+        "retriever.n-retrieved": "n",
+        "max-new-tokens": "g",
+        "model-name": "m",
+        "dataset-name": "d",
+        "retriever.api-key": "api-key",
+        "retriever.type": "r",
+    },
+):
     prefill: CliSubCommand[Prefill]
     chat: CliSubCommand[Chat]
 

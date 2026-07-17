@@ -2,10 +2,12 @@ import compression.zstd
 import json
 import math
 import types
+from functools import cached_property
 from pathlib import Path
-from typing import BinaryIO, Callable, Protocol, Unpack
+from typing import Annotated, BinaryIO, Callable, Literal, Protocol, Unpack
 
 import torch
+from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.models import QueryRequest, SearchParams
 from safetensors.torch import load, save
@@ -30,19 +32,27 @@ from kv_search.timer import timers
 
 class Retriever(Protocol):
     def retrieve(
-        self, query_states: torch.Tensor, layer_idx: int
+        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return topk (keys, values) from prefill context for given queries."""
 
 
-class FullContextRetriever:
-    pass
+class FullContextRetriever(BaseModel):
+    type: Literal["full"] = "full"
+
+    def retrieve(
+        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
+    ):
+        layer = prefill.layers[layer_idx]
+        assert isinstance(layer, CacheLayerMixin)
+        assert layer.keys is not None
+        assert layer.values is not None
+        return layer.keys, layer.values
 
 
-class TopKRetriever:
-    def __init__(self, n_retrieved: int, prefill: DynamicCache):
-        self.prefill = prefill
-        self.n_retrieved = n_retrieved
+class TopKRetriever(BaseModel):
+    type: Literal["topk"] = "topk"
+    n_retrieved: int = 128
 
     def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
@@ -83,11 +93,9 @@ class TopKRetriever:
         return attn_weights
 
     def retrieve(
-        self,
-        query_states: torch.Tensor,
-        layer_idx: int,
+        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
     ):
-        layer = self.prefill.layers[layer_idx]
+        layer = prefill.layers[layer_idx]
         assert isinstance(layer, CacheLayerMixin)
         assert layer.keys is not None
         assert layer.values is not None
@@ -102,68 +110,79 @@ class TopKRetriever:
         return keys, values
 
 
-class QdrantRetriever:
-    def __init__(self, client: QdrantClient, n_retrieved: int):
-        self.n_retrieved = n_retrieved
-        self.client = client
+class QdrantRetriever(BaseModel):
+    type: Literal["qdrant"] = "qdrant"
+    n_retrieved: int = 128
+    url: str = "localhost"
+    api_key: str | None = None
+
+    @cached_property
+    def _client(self) -> QdrantClient:
+        return QdrantClient(self.url, api_key=self.api_key)
 
     def retrieve(
-        self,
-        query_states: torch.Tensor,
-        layer_idx: int,
+        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
     ):
         cached_keys_per_head: list[torch.Tensor] = []
         cached_values_per_head: list[torch.Tensor] = []
         for head_idx in range(4):
             query_idx = head_idx * 4
-            data = self.client.query_batch_points(
-                collection_name=f"layer={layer_idx};head={head_idx}",
-                requests=[
-                    QueryRequest(
-                        query=query_states[0, query_idx + i, token_idx]
-                        .cpu()
-                        .to(torch.float)
-                        .numpy(),
-                        params=SearchParams(exact=True),
-                        with_payload=True,
-                        with_vector=True,
-                        using="key",
-                        limit=self.n_retrieved,
+            with timers.qdrant_retrieve:
+                data = self._client.query_batch_points(
+                    collection_name=f"layer={layer_idx};head={head_idx}",
+                    requests=[
+                        QueryRequest(
+                            query=query_states[0, query_idx + i, token_idx]
+                            .cpu()
+                            .to(torch.float)
+                            .numpy(),
+                            params=SearchParams(exact=True),
+                            with_payload=True,
+                            with_vector=True,
+                            using="key",
+                            limit=self.n_retrieved,
+                        )
+                        for token_idx in range(query_states.shape[2])
+                        for i in range(4)
+                    ],
+                )
+            with timers.qdrant_assemble:
+                cached_key_head: list[list[float]] = []
+                cached_value_head: list[list[float]] = []
+                for r in data:
+                    for p in r.points:
+                        assert isinstance(p.vector, dict)
+                        assert "key" in p.vector
+                        assert "value" in p.vector
+                        cached_key_head.append(p.vector["key"])  # ty:ignore[invalid-argument-type]
+                        cached_value_head.append(p.vector["value"])  # ty:ignore[invalid-argument-type]
+                cached_keys_per_head.append(
+                    torch.tensor(
+                        cached_key_head,
+                        dtype=query_states.dtype,
+                        device=query_states.device,
                     )
-                    for token_idx in range(query_states.shape[2])
-                    for i in range(4)
-                ],
-            )
-            cached_key_head: list[list[float]] = []
-            cached_value_head: list[list[float]] = []
-            for r in data:
-                for p in r.points:
-                    assert isinstance(p.vector, dict)
-                    assert "key" in p.vector
-                    assert "value" in p.vector
-                    cached_key_head.append(p.vector["key"])
-                    cached_value_head.append(p.vector["value"])
-            cached_keys_per_head.append(
-                torch.tensor(
-                    cached_key_head,
-                    dtype=query_states.dtype,
-                    device=query_states.device,
+                    .unsqueeze(0)
+                    .unsqueeze(0)
                 )
-                .unsqueeze(0)
-                .unsqueeze(0)
-            )
-            cached_values_per_head.append(
-                torch.tensor(
-                    cached_value_head,
-                    dtype=query_states.dtype,
-                    device=query_states.device,
+                cached_values_per_head.append(
+                    torch.tensor(
+                        cached_value_head,
+                        dtype=query_states.dtype,
+                        device=query_states.device,
+                    )
+                    .unsqueeze(0)
+                    .unsqueeze(0)
                 )
-                .unsqueeze(0)
-                .unsqueeze(0)
-            )
-        cached_keys = torch.cat(cached_keys_per_head, dim=1)
-        cached_values = torch.cat(cached_values_per_head, dim=1)
+        with timers.qdrant_assemble:
+            cached_keys = torch.cat(cached_keys_per_head, dim=1)
+            cached_values = torch.cat(cached_values_per_head, dim=1)
         return cached_keys, cached_values
+
+
+RetrieverConfig = Annotated[
+    TopKRetriever | FullContextRetriever | QdrantRetriever, Field(discriminator="type")
+]
 
 
 class RetrievalCache(DynamicCache):
@@ -225,7 +244,7 @@ class RetrievalCache(DynamicCache):
 
         if query_states is not None:
             cached_keys, cached_values = self.retriever.retrieve(
-                query_states, layer_idx
+                query_states, layer_idx, self.prefill
             )
             keys = torch.cat([cached_keys, keys], dim=2)
             values = torch.cat([cached_values, values], dim=2)
@@ -395,7 +414,9 @@ def load_cache(
     return cache, meta["context_len"]
 
 
-def _make_attention_mask(attn_impl: str, q_len: int, k_len: int, dtype, device) -> torch.Tensor | None:
+def _make_attention_mask(
+    attn_impl: str, q_len: int, k_len: int, dtype, device
+) -> torch.Tensor | None:
     # Need to dynamically create our attention mask because transformers does not have sane defaults for causal/attention masks during inference
     # usually this is created beforehand, when the prompt is tokenized, but we don't know the context length then
     if q_len <= 1:
@@ -610,7 +631,7 @@ def _ministral3_forward(
 def _gemma3_forward(
     self,
     hidden_states: torch.Tensor,
-    position_embeddings: torch.Tensor = None,
+    position_embeddings: torch.Tensor,
     attention_mask: torch.Tensor | None = None,
     past_key_values: Cache | None = None,
     **kwargs,
