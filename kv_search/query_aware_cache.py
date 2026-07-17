@@ -338,22 +338,22 @@ def load_cache(
     return cache, meta["context_len"]
 
 
-def _make_attention_mask(
-    attention_mask: torch.Tensor | None, q_len: int, k_len: int, dtype, device
-):
+def _make_attention_mask(q_len: int, k_len: int, dtype, device) -> torch.Tensor | None:
     # Need to dynamically create our attention mask because transformers does not have sane defaults for causal/attention masks during inference
     # usually this is created beforehand, when the prompt is tokenized, but we don't know the context length then
-    if attention_mask is None and q_len > 1:
-        attention_mask = torch.zeros(q_len, k_len, dtype=dtype, device=device)
-        attention_mask[:, k_len - q_len :] = torch.triu(
-            torch.full(
-                (q_len, q_len),
-                torch.finfo(dtype).min,
-                device=device,
-            ),
-            diagonal=1,
-        )
-        return attention_mask[None, None]
+    if q_len <= 1:
+        return None
+
+    attention_mask = torch.zeros(q_len, k_len, dtype=dtype, device=device)
+    attention_mask[:, k_len - q_len :] = torch.triu(
+        torch.full(
+            (q_len, q_len),
+            torch.finfo(dtype).min,
+            device=device,
+        ),
+        diagonal=1,
+    )
+    return attention_mask[None, None]
 
 
 def _qwen_3_5_forward(
@@ -394,7 +394,6 @@ def _qwen_3_5_forward(
         )
 
     attention_mask = _make_attention_mask(
-        attention_mask,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,
@@ -452,7 +451,6 @@ def _qwen_2_5_forward(
         )
 
     attention_mask = _make_attention_mask(
-        attention_mask,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,
@@ -517,7 +515,6 @@ def _ministral3_forward(
         )
 
     attention_mask = _make_attention_mask(
-        attention_mask,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,
@@ -580,7 +577,6 @@ def _gemma3_forward(
         )
 
     attention_mask = _make_attention_mask(
-        attention_mask,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,
@@ -662,7 +658,6 @@ def _gemma4_forward(
         )
 
     attention_mask = _make_attention_mask(
-        attention_mask,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,
