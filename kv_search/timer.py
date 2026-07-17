@@ -1,4 +1,5 @@
 import time
+from collections.abc import Callable
 from pydantic import BaseModel, Field
 
 
@@ -17,6 +18,14 @@ class Timer(BaseModel):
         self.total += elapsed
         self.timings.append(elapsed)
 
+    def __call__[**P, T](self, func: Callable[P, T]) -> Callable[P, T]:
+        def inner(*args: P.args, **kwargs: P.kwargs) -> T:
+            with self:
+                ret = func(*args, **kwargs)
+            return ret
+
+        return inner
+
 
 class Timers(BaseModel):
     model_load: Timer = Timer(name="model_load")
@@ -27,5 +36,6 @@ class Timers(BaseModel):
 
     qdrant_retrieve: Timer = Timer(name="qdrant_retrieve")
     qdrant_assemble: Timer = Timer(name="qdrant_assemble")
+
 
 timers = Timers()

@@ -66,83 +66,77 @@ ModelName = Literal[
 ]
 
 
+@timers.model_load
 def _load_model(model_name: ModelName) -> tuple[ModelType, ProcessorType]:
-    with timers.model_load:
-        processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
-        if model_name in IS_MULTIMODAL:
-            model: ModelType = (
-                AutoModelForMultimodalLM.from_pretrained(
-                    model_name,
-                    attn_implementation="sdpa",
-                    dtype=torch.bfloat16,
-                )
-                .cuda()
-                .eval()
-            )
-        else:
-            model: ModelType = (
-                AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    attn_implementation="sdpa",
-                    dtype=torch.bfloat16,
-                )
-                .cuda()  # ty:ignore[missing-argument]
-                .eval()
-            )
+    processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
+    if model_name in IS_MULTIMODAL:
+        model: ModelType = AutoModelForMultimodalLM.from_pretrained(
+            model_name,
+            attn_implementation="sdpa",
+            dtype=torch.bfloat16,
+            device_map="cuda",
+        ).eval()
+    else:
+        model: ModelType = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            attn_implementation="sdpa",
+            dtype=torch.bfloat16,
+            device_map="cuda",
+        ).eval()
 
     bind_query_aware_cache(model)
     return model, processor
 
 
+@timers.prefill_gen
 def _do_prefill(
     messages: Message,
     model: ModelType,
     processor: ProcessorType,
     past_key_values: RecordingCache,
 ):
-    with timers.prefill_gen:
-        inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
-            messages.prefill,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-        )  # ty:ignore[invalid-assignment]
-        print(f"{inputs['input_ids'].shape=}")
-        print(f"{len(past_key_values)=}")
-        input_chunks = torch.split(inputs["input_ids"], 2048, -1)
-        attention_masks = torch.split(inputs["attention_mask"], 2048, -1)
+    inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
+        messages.prefill,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    )  # ty:ignore[invalid-assignment]
+    print(f"{inputs['input_ids'].shape=}")
+    print(f"{len(past_key_values)=}")
+    input_chunks = torch.split(inputs["input_ids"], 2048, -1)
+    attention_masks = torch.split(inputs["attention_mask"], 2048, -1)
+    if "mm_token_type_ids" in inputs:
+        mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 2048, -1)
+
+    for i, (input_ids, attention_mask) in track(
+        enumerate(zip(input_chunks, attention_masks)),
+        total=len(input_chunks),
+        description="Computing Prefill",
+    ):
+        input_ids = input_ids.to(model.device)
+        attention_mask = attention_mask.to(model.device)
+
+        additional_args = {}
         if "mm_token_type_ids" in inputs:
-            mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 2048, -1)
+            additional_args["mm_token_type_ids"] = mm_token_type_chunks[i].to(
+                model.device
+            )
 
-        for i, (input_ids, attention_mask) in track(
-            enumerate(zip(input_chunks, attention_masks)),
-            total=len(input_chunks),
-            description="Computing Prefill",
-        ):
-            input_ids = input_ids.to(model.device)
-            attention_mask = attention_mask.to(model.device)
-
-            additional_args = {}
-            if "mm_token_type_ids" in inputs:
-                additional_args["mm_token_type_ids"] = mm_token_type_chunks[i].to(
-                    model.device
-                )
-
-            with torch.no_grad():
-                with torch.nn.attention.sdpa_kernel(
-                    [
-                        torch.nn.attention.SDPBackend.FLASH_ATTENTION,
-                        torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
-                    ]
-                ):
-                    past_key_values = model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        **additional_args,
-                        past_key_values=past_key_values,
-                        logits_to_keep=1,
-                    ).past_key_values
+        with torch.no_grad():
+            with torch.nn.attention.sdpa_kernel(
+                [
+                    torch.nn.attention.SDPBackend.FLASH_ATTENTION,
+                    torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
+                ]
+            ):
+                past_key_values = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **additional_args,
+                    past_key_values=past_key_values,
+                    logits_to_keep=1,
+                ).past_key_values
 
 
 class CacheImpl(Enum):
