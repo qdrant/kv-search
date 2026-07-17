@@ -172,7 +172,7 @@ def _do_prefill(
 
 
 def _upsert(cache: RecordingCache, client: QdrantClient, batch_size: int = 128):
-    for i, layer in track(enumerate(cache.layers), description="Upserting"):
+    for i, layer in track(enumerate(cache.layers), description="Upserting", total=len(cache.layers)):
         if not isinstance(layer, CacheLayerMixin):
             continue
 
@@ -200,8 +200,8 @@ def _upsert(cache: RecordingCache, client: QdrantClient, batch_size: int = 128):
             ids = torch.split(
                 torch.arange(layer.keys.shape[2], dtype=torch.int), batch_size
             )
-            keys = torch.split(layer.keys.to(torch.float), batch_size)
-            values = torch.split(layer.values.to(torch.float), batch_size)
+            keys = torch.split(layer.keys[0, h].cpu().to(torch.float), batch_size)
+            values = torch.split(layer.values[0, h].cpu().to(torch.float), batch_size)
 
             for idx, k, v in track(
                 zip(ids, keys, values),

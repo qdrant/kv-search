@@ -10,6 +10,7 @@ import torch
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.models import QueryRequest, SearchParams
+from rich.progress import track
 from safetensors.torch import load, save
 from transformers import PreTrainedConfig, PretrainedConfig
 from transformers.cache_utils import (
@@ -384,7 +385,7 @@ def save_cache(
     context_len: int,
 ) -> None:
     (path / "meta.json").write_text(json.dumps({"context_len": context_len}))
-    for i, layer in enumerate(cache.layers):
+    for i, layer in track(enumerate(cache.layers), description="Writing to disk", total=len(cache.layers)):
         tensors = _layer_to_dict(layer)
         blob = compression.zstd.compress(save(tensors))
         (path / f"layer_{i:02d}.safetensors.zst").write_bytes(blob)
