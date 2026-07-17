@@ -2,6 +2,10 @@ import contextlib
 import io
 import os
 
+from qdrant_client import QdrantClient
+from qdrant_client.models import Batch, Distance, HnswConfigDiff, VectorParams
+from transformers.cache_utils import CacheLayerMixin
+
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 
 import importlib.util
@@ -37,7 +41,6 @@ with contextlib.redirect_stdout(io.StringIO()):
         TextStreamer,
     )
 
-from kv_search.data import Datasets, Message, load_dataset
 from kv_search.cache import (
     QdrantRetriever,
     RecordingCache,
@@ -47,6 +50,7 @@ from kv_search.cache import (
     load_cache,
     save_cache,
 )
+from kv_search.data import Datasets, Message, load_dataset
 from kv_search.timer import timers
 
 transformers.utils.logging.set_verbosity(transformers.utils.logging.CRITICAL)
@@ -119,6 +123,7 @@ def _do_prefill(
     model: ModelType,
     processor: ProcessorType,
     past_key_values: RecordingCache,
+    batch_size: int = 4096,
 ):
     inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
         messages.prefill,
@@ -127,12 +132,10 @@ def _do_prefill(
         return_dict=True,
         return_tensors="pt",
     )  # ty:ignore[invalid-assignment]
-    print(f"{inputs['input_ids'].shape=}")
-    print(f"{len(past_key_values)=}")
-    input_chunks = torch.split(inputs["input_ids"], 2048, -1)
-    attention_masks = torch.split(inputs["attention_mask"], 2048, -1)
+    input_chunks = torch.split(inputs["input_ids"], batch_size, -1)
+    attention_masks = torch.split(inputs["attention_mask"], batch_size, -1)
     if "mm_token_type_ids" in inputs:
-        mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], 2048, -1)
+        mm_token_type_chunks = torch.split(inputs["mm_token_type_ids"], batch_size, -1)
 
     for i, (input_ids, attention_mask) in track(
         enumerate(zip(input_chunks, attention_masks)),
@@ -168,6 +171,62 @@ def _do_prefill(
             ).past_key_values
 
 
+def _upsert(cache: RecordingCache, client: QdrantClient, batch_size: int = 128):
+    for i, layer in track(enumerate(cache.layers), description="Upserting"):
+        if not isinstance(layer, CacheLayerMixin):
+            continue
+
+        for h in track(range(4), transient=True, description="Head"):
+            if client.collection_exists(f"layer={i};head={h}"):
+                client.delete_collection(f"layer={i};head={h}")
+
+            assert layer.keys is not None
+            assert layer.values is not None
+
+            client.create_collection(
+                collection_name=f"layer={i};head={h}",
+                vectors_config={
+                    "key": VectorParams(
+                        size=layer.keys.shape[-1], distance=Distance.DOT
+                    ),
+                    "value": VectorParams(
+                        size=layer.keys.shape[-1],
+                        distance=Distance.DOT,
+                        hnsw_config=HnswConfigDiff(m=0),
+                    ),
+                },
+            )
+
+            ids = torch.split(
+                torch.arange(layer.keys.shape[2], dtype=torch.int), batch_size
+            )
+            keys = torch.split(layer.keys.to(torch.float), batch_size)
+            values = torch.split(layer.values.to(torch.float), batch_size)
+
+            for idx, k, v in track(
+                zip(ids, keys, values),
+                total=len(keys),
+                transient=True,
+                description="Batch",
+            ):
+                client.upsert(
+                    collection_name=f"layer={i};head={h}",
+                    points=Batch(
+                        ids=idx.tolist(),
+                        vectors={
+                            "key": k.numpy(),
+                            "value": v.numpy(),
+                        },
+                    ),
+                )
+
+
+def _print_stats():
+    rich.print(timers)
+    rich.print(f"peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
+    rich.print(f"peak reserved:  {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB")
+
+
 class TimedStreamer(TextStreamer):
     def __init__(
         self,
@@ -194,12 +253,14 @@ class CacheImpl(Enum):
     QDRANT = auto()
 
 
-class Prefill(BaseModel):
+class CmdPrefill(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
     upsert: bool = False
-    qdrant_url: str = "localhost"
-    qdrant_api_key: str | None = None
+    url: str = "localhost"
+    api_key: str | None = None
+    upsert_batch_size: int = 128
+    prefill_batch_size: int = 4096
 
     def cli_cmd(self) -> None:
         model, processor = _load_model(self.model_name)
@@ -207,29 +268,28 @@ class Prefill(BaseModel):
         cache_dir = Path(f"cache/{self.dataset_name}/{model.config.model_type}")
         cache_dir.mkdir(exist_ok=True, parents=True)
 
-        past_key_values = RecordingCache(path=cache_dir, config=model.config)
+        cache = RecordingCache(path=cache_dir, config=model.config)
         messages = load_dataset(
             self.dataset_name, multimodal=self.model_name in IS_MULTIMODAL
         )
 
-        _do_prefill(messages, model, processor, past_key_values)
+        _do_prefill(messages, model, processor, cache, self.prefill_batch_size)
 
         save_cache(
-            past_key_values,
+            cache,
             cache_dir,
-            past_key_values.get_seq_length(),
+            cache.get_seq_length(),
         )
-        past_key_values.finalize()
-        rich.print(timers)
-        rich.print(
-            f"peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
-        )
-        rich.print(
-            f"peak reserved:  {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB"
-        )
+        cache.finalize()
+
+        if self.upsert:
+            client = QdrantClient(self.url, api_key=self.api_key)
+            _upsert(cache, client, self.upsert_batch_size)
+
+        _print_stats()
 
 
-class Chat(BaseModel):
+class CmdChat(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
     retriever: RetrieverConfig = Field(default_factory=QdrantRetriever)
@@ -243,60 +303,78 @@ class Chat(BaseModel):
 
         prefill, context_len = load_cache(cache_dir, model.config)
 
-        past_key_values = RetrievalCache(
+        cache = RetrievalCache(
             retriever=self.retriever, prefill=prefill, config=model.config
         )
 
         streamer = TimedStreamer(processor.tokenizer, skip_prompt=True)
 
-        # messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
-        # rich.print(messages.query)
+        try:
+            self._repl(model, processor, cache, context_len, streamer)
+        finally:
+            _print_stats()
+
+    def _repl(
+        self,
+        model: ModelType,
+        processor: ProcessorType,
+        cache: RetrievalCache,
+        context_len: int,
+        streamer: TimedStreamer,
+    ) -> None:
         while True:
             try:
-                user = input("\n> ")
-            except KeyboardInterrupt:
-                break
+                user = input("\n> ").strip()
+            except EOFError, KeyboardInterrupt:
+                print()
+                return
+
+            if not user:
+                continue
 
             try:
-                print("\n")
-                inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
-                    [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt",
-                    enable_thinking=False,
-                )  # ty:ignore[invalid-assignment]
-                inputs = inputs.to(model.device)
-
-                # offset positional embeddings to beyond prefill content
-                prompt_len = inputs["input_ids"].shape[1]
-                inputs["position_ids"] = torch.arange(
-                    context_len, context_len + prompt_len, device=model.device
-                ).unsqueeze(0)
-
-                model.generate(
-                    **inputs,  # ty:ignore[invalid-argument-type]
-                    max_new_tokens=self.max_new_tokens,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                    streamer=streamer,
-                )  # ty:ignore[invalid-argument-type]
+                print()
+                self._generate(model, processor, cache, context_len, streamer, user)
             except KeyboardInterrupt:
-                continue
+                streamer.end()
             finally:
-                past_key_values.reset()
+                cache.reset()
 
-        rich.print(timers)
-        rich.print(
-            f"peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
-        )
-        rich.print(
-            f"peak reserved:  {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB"
-        )
+    def _generate(
+        self,
+        model: ModelType,
+        processor: ProcessorType,
+        cache: RetrievalCache,
+        context_len: int,
+        streamer: TimedStreamer,
+        user: str,
+    ):
+        inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            enable_thinking=False,
+        )  # ty:ignore[invalid-assignment]
+        inputs = inputs.to(model.device)
+
+        # offset positional embeddings to beyond prefill content
+        prompt_len = inputs["input_ids"].shape[1]
+        inputs["position_ids"] = torch.arange(
+            context_len, context_len + prompt_len, device=model.device
+        ).unsqueeze(0)
+
+        model.generate(
+            **inputs,  # ty:ignore[invalid-argument-type]
+            max_new_tokens=self.max_new_tokens,
+            past_key_values=cache,
+            use_cache=True,
+            streamer=streamer,
+        )  # ty:ignore[invalid-argument-type]
 
 
-class KvSearch(
+class CmdKvSearch(
     BaseModel,
     cli_shortcuts={
         "retriever.url": "url",
@@ -308,15 +386,15 @@ class KvSearch(
         "retriever.type": "r",
     },
 ):
-    prefill: CliSubCommand[Prefill]
-    chat: CliSubCommand[Chat]
+    prefill: CliSubCommand[CmdPrefill]
+    chat: CliSubCommand[CmdChat]
 
     def cli_cmd(self) -> None:
         CliApp.run_subcommand(self)
 
 
 def main() -> None:
-    CliApp.run(KvSearch)
+    CliApp.run(CmdKvSearch)
 
 
 if __name__ == "__main__":
