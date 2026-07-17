@@ -1,12 +1,12 @@
 import importlib.util
 from enum import Enum, auto
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import rich
 import torch
 from pydantic import BaseModel, Field
-from pydantic_settings import CliApp, CliSubCommand, SettingsConfigDict
+from pydantic_settings import CliApp, CliSubCommand
 from rich.progress import track
 from transformers import (
     AutoModelForCausalLM,
@@ -19,6 +19,7 @@ from transformers import (
     Gemma4Processor,
     Mistral3ForConditionalGeneration,
     PixtralProcessor,
+    PreTrainedTokenizerBase,
     Qwen2ForCausalLM,
     Qwen2Tokenizer,
     Qwen3_5ForConditionalGeneration,
@@ -155,6 +156,20 @@ def _do_prefill(
             ).past_key_values
 
 
+class TimedStreamer(TextStreamer):
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        skip_prompt: bool = False,
+        **decode_kwargs: Any,
+    ):
+        super().__init__(tokenizer, skip_prompt, **decode_kwargs)
+
+    def put(self, value):
+        timers.token_gen.record()
+        super().put(value)
+
+
 class CacheImpl(Enum):
     TORCH = auto()
     QDRANT = auto()
@@ -213,37 +228,53 @@ class Chat(BaseModel):
             retriever=self.retriever, prefill=prefill, config=model.config
         )
 
-        streamer = TextStreamer(processor.tokenizer, skip_prompt=True)
+        streamer = TimedStreamer(processor.tokenizer, skip_prompt=True)
 
         # messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
         # rich.print(messages.query)
         while True:
-            user = input("\n> ")
-            print("\n")
-            inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
-                [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
-                add_generation_prompt=True,
-                tokenize=True,
-                return_dict=True,
-                return_tensors="pt",
-                enable_thinking=False,
-            )  # ty:ignore[invalid-assignment]
-            inputs = inputs.to(model.device)
+            try:
+                user = input("\n> ")
+            except KeyboardInterrupt:
+                break
 
-            # offset positional embeddings to beyond prefill content
-            prompt_len = inputs["input_ids"].shape[1]
-            inputs["position_ids"] = torch.arange(
-                context_len, context_len + prompt_len, device=model.device
-            ).unsqueeze(0)
+            try:
+                print("\n")
+                inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
+                    [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt",
+                    enable_thinking=False,
+                )  # ty:ignore[invalid-assignment]
+                inputs = inputs.to(model.device)
 
-            model.generate(
-                **inputs,  # ty:ignore[invalid-argument-type]
-                max_new_tokens=self.max_new_tokens,
-                past_key_values=past_key_values,
-                use_cache=True,
-                streamer=streamer,
-            )  # ty:ignore[invalid-argument-type]
-            past_key_values.reset()
+                # offset positional embeddings to beyond prefill content
+                prompt_len = inputs["input_ids"].shape[1]
+                inputs["position_ids"] = torch.arange(
+                    context_len, context_len + prompt_len, device=model.device
+                ).unsqueeze(0)
+
+                model.generate(
+                    **inputs,  # ty:ignore[invalid-argument-type]
+                    max_new_tokens=self.max_new_tokens,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    streamer=streamer,
+                )  # ty:ignore[invalid-argument-type]
+            except KeyboardInterrupt:
+                continue
+            finally:
+                past_key_values.reset()
+
+        rich.print(timers)
+        rich.print(
+            f"peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
+        )
+        rich.print(
+            f"peak reserved:  {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB"
+        )
 
 
 class KvSearch(
