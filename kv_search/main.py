@@ -153,21 +153,23 @@ class Prefill(BaseModel):
 
     def cli_cmd(self) -> None:
         model, processor = _load_model(self.model_name)
-        past_key_values = RecordingCache(config=model.config)
+
+        cache_dir = Path(f"cache/{self.dataset_name}/{model.config.model_type}")
+        cache_dir.mkdir(exist_ok=True, parents=True)
+
+        past_key_values = RecordingCache(path=cache_dir, config=model.config)
         messages = load_dataset(
             self.dataset_name, multimodal=self.model_name in IS_MULTIMODAL
         )
 
         _do_prefill(messages, model, processor, past_key_values)
 
-        cache_dir = Path(f"cache/{self.dataset_name}/{model.config.model_type}")
-        cache_dir.mkdir(exist_ok=True, parents=True)
         save_cache(
             past_key_values,
             cache_dir,
             past_key_values.get_seq_length(),
-            past_key_values.queries,
         )
+        past_key_values.finalize()
         rich.print(timers)
 
 

@@ -1,8 +1,9 @@
+import math
 import compression.zstd
 import json
 import types
 from pathlib import Path
-from typing import Callable, Protocol, Unpack
+from typing import Callable, Protocol, Unpack, BinaryIO
 
 import torch
 from qdrant_client import QdrantClient
@@ -231,27 +232,87 @@ class RetrievalCache(DynamicCache):
 
 
 class RecordingCache(DynamicCache):
-    def __init__(self, **kwargs):
+    # See https://huggingface.co/docs/safetensors/en/index#format
+
+    HEADER_RESERVED_BYTES = 256  # 8 bytes of header size + header
+
+    def __init__(self, path: Path, **kwargs):
         super().__init__(**kwargs)
-        self.queries: list[torch.Tensor | None] = [None] * len(self.layers)
+        self.path = path
+        self._files: dict[int, BinaryIO] = {}
+        self._shapes: dict[int, list[int]] = {}
 
     def update(
-        self, key_states, value_states, layer_idx, *args, query_states=None, **kwargs
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        *args,
+        query_states: torch.Tensor | None = None,
+        **kwargs,
     ):
         if query_states is not None:
-            if layer_idx >= len(self.queries):
-                self.queries.extend([None] * (layer_idx - len(self.queries) + 1))
-            if self.queries[layer_idx] is None:
-                self.queries[layer_idx] = query_states.detach().cpu()
-            else:
-                self.queries[layer_idx] = torch.cat(
-                    [self.queries[layer_idx], query_states.detach().cpu()], dim=-2
-                )
+            assert query_states.dtype == torch.bfloat16
+
+            # [batch, head, seq_len, dim] -> [batch, seq_len, head, dim]
+            # batch is always 1, so this way, in the file, all heads for one
+            # token are stored next to eachother and we can just append new tokens
+            chunk = query_states.transpose(1, 2).contiguous()
+            if layer_idx not in self._files:
+                f = (self.path / f"queries_{layer_idx:02d}.safetensors").open("wb")
+                # Reserve some bytes for the header to be written to later
+                f.write(b"\0" * self.HEADER_RESERVED_BYTES)
+
+                self._files[layer_idx] = f
+                self._shapes[layer_idx] = [
+                    chunk.shape[0],
+                    0,  # will grow this over time
+                    chunk.shape[2],
+                    chunk.shape[3],
+                ]
+
+            # write to file as bytes, the conversion to uint8 just makes sure it's a dtype numpy
+            # can handle (not bf16)
+            self._files[layer_idx].write(chunk.cpu().view(torch.uint8).numpy().data)
+            self._shapes[layer_idx][1] += chunk.shape[1]
 
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
         )
         return keys, values
+
+    def finalize(self):
+        for layer_idx, f in self._files.items():
+            shape = self._shapes[layer_idx]
+
+            # bf16 means 2 bytes per number
+            nbytes = 2 * math.prod(shape)
+            header = json.dumps(
+                {
+                    "queries": {
+                        "dtype": "BF16",
+                        "shape": shape,
+                        "data_offsets": [0, nbytes],
+                    }
+                }
+            ).encode()
+
+            # make sure the header fits in its slot
+            assert len(header) <= 256 - 8
+
+            # pad header with space, which is valid json
+            header += b" " * (256 - 8 - len(header))
+
+            f.seek(0)
+
+            # write header size
+            f.write((256 - 8).to_bytes(8, "little"))
+
+            f.write(header)
+            f.close()
+
+        self._files.clear()
+        self._shapes.clear()
 
 
 def _layer_to_dict(
@@ -299,20 +360,12 @@ def save_cache(
     cache: Cache,
     path: Path,
     context_len: int,
-    queries: list[torch.Tensor | None] | None = None,
 ) -> None:
     (path / "meta.json").write_text(json.dumps({"context_len": context_len}))
     for i, layer in enumerate(cache.layers):
         tensors = _layer_to_dict(layer)
         blob = compression.zstd.compress(save(tensors))
         (path / f"layer_{i:02d}.safetensors.zst").write_bytes(blob)
-
-    if queries is not None:
-        tensors = {
-            str(i): _shuffle_bf16(v) for i, v in enumerate(queries) if v is not None
-        }
-        blob = compression.zstd.compress(save(tensors))
-        (path / "queries.safetensors.zst").write_bytes(blob)
 
 
 def load_cache(
@@ -329,7 +382,7 @@ def load_cache(
             tensors[k] = _unshuffle_bf16(v).to(device, non_blocking=True)
         if isinstance(layer, LinearAttentionCacheLayerMixin):
             layer.update_conv_state(tensors["conv_states"])
-            layer.update_recurrent_state(tensors["conv_states"])
+            layer.update_recurrent_state(tensors["recurrent_states"])
         else:
             layer.lazy_initialization(tensors["keys"], tensors["values"])
             layer.keys = tensors["keys"]
