@@ -1,29 +1,31 @@
 import time
 from collections.abc import Callable
-from pydantic import BaseModel, Field
+from dataclasses import dataclass, field, fields
+
+from rich.table import Table
 
 
-class Timer(BaseModel):
-    name: str
-    total: float = 0
-    start: float | None = None
-    timings: list[float] = Field(default_factory=list)
+@dataclass
+class Timer:
+    _start: float | None = field(default=None, repr=False, compare=False)
+    timings: list[float] = field(default_factory=list)
 
     def record(self):
-        if self.start is not None:
-            elapsed = time.perf_counter() - self.start
-            self.total += elapsed
+        if self._start is not None:
+            elapsed = time.perf_counter() - self._start
             self.timings.append(elapsed)
-        self.start = time.perf_counter()
+        self._start = time.perf_counter()
+
+    def reset_lap(self):
+        self._start = None
 
     def __enter__(self):
-        self.start = time.perf_counter()
+        self._start = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        assert self.start is not None
-        elapsed = time.perf_counter() - self.start
-        self.total += elapsed
+        assert self._start is not None
+        elapsed = time.perf_counter() - self._start
         self.timings.append(elapsed)
 
     def __call__[**P, T](self, func: Callable[P, T]) -> Callable[P, T]:
@@ -34,20 +36,45 @@ class Timer(BaseModel):
 
         return inner
 
+    @property
+    def count(self) -> int:
+        return len(self.timings)
+
+    @property
+    def total(self) -> float:
+        return sum(self.timings)
+
+    @property
+    def mean(self) -> float:
+        return self.total / self.count if self.timings else 0
+
     def __repr__(self) -> str:
-        return f'{{"total": {self.total:.2f}, "average": {sum(self.timings)/len(self.timings):.2f}}}'
+        return f'{{"total": {self.total:.2f}, "average": {sum(self.timings) / len(self.timings):.2f}}}'
 
 
-class Timers(BaseModel):
-    model_load: Timer = Timer(name="model_load")
-    prefill_gen: Timer = Timer(name="prefill_gen")
-    prefill_save: Timer = Timer(name="prefill_save")
-    prefill_load: Timer = Timer(name="prefill_load")
+@dataclass
+class Timers:
+    model_load: Timer = field(default_factory=Timer)
+    prefill_gen: Timer = field(default_factory=Timer)
+    prefill_save: Timer = field(default_factory=Timer)
+    prefill_load: Timer = field(default_factory=Timer)
 
-    token_gen: Timer = Timer(name="token_gen")
+    token_gen: Timer = field(default_factory=Timer)
 
-    qdrant_retrieve: Timer = Timer(name="qdrant_retrieve")
-    qdrant_assemble: Timer = Timer(name="qdrant_assemble")
+    qdrant_retrieve: Timer = field(default_factory=Timer)
+    qdrant_assemble: Timer = field(default_factory=Timer)
+
+    def __rich__(self) -> Table:
+        table = Table(title="timings", title_justify="left")
+        table.add_column("timer")
+        table.add_column("total (s)", justify="right")
+        table.add_column("mean (s)", justify="right")
+        for f in fields(self):
+            t: Timer = getattr(self, f.name)
+            if t.count == 0:
+                continue
+            table.add_row(f.name, f"{t.total:.2f}", f"{t.mean:.2f}")
+        return table
 
 
 timers = Timers()

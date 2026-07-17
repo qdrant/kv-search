@@ -1,3 +1,9 @@
+import contextlib
+import io
+import os
+
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+
 import importlib.util
 from enum import Enum, auto
 from pathlib import Path
@@ -5,30 +11,34 @@ from typing import Any, Literal
 
 import rich
 import torch
+import transformers.utils.logging
 from pydantic import BaseModel, Field
 from pydantic_settings import CliApp, CliSubCommand
 from rich.progress import track
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForMultimodalLM,
-    AutoProcessor,
-    BatchEncoding,
-    Gemma3ForConditionalGeneration,
-    Gemma3Processor,
-    Gemma4ForConditionalGeneration,
-    Gemma4Processor,
-    Mistral3ForConditionalGeneration,
-    PixtralProcessor,
-    PreTrainedTokenizerBase,
-    Qwen2ForCausalLM,
-    Qwen2Tokenizer,
-    Qwen3_5ForConditionalGeneration,
-    Qwen3VLProcessor,
-    TextStreamer,
-)
+
+# auto_docstring emits [ERROR] lines via print() at class-definition time
+with contextlib.redirect_stdout(io.StringIO()):
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoModelForMultimodalLM,
+        AutoProcessor,
+        BatchEncoding,
+        Gemma3ForConditionalGeneration,
+        Gemma3Processor,
+        Gemma4ForConditionalGeneration,
+        Gemma4Processor,
+        Mistral3ForConditionalGeneration,
+        PixtralProcessor,
+        PreTrainedTokenizerBase,
+        Qwen2ForCausalLM,
+        Qwen2Tokenizer,
+        Qwen3_5ForConditionalGeneration,
+        Qwen3VLProcessor,
+        TextStreamer,
+    )
 
 from kv_search.data import Datasets, Message, load_dataset
-from kv_search.query_aware_cache import (
+from kv_search.cache import (
     QdrantRetriever,
     RecordingCache,
     RetrievalCache,
@@ -38,6 +48,8 @@ from kv_search.query_aware_cache import (
     save_cache,
 )
 from kv_search.timer import timers
+
+transformers.utils.logging.set_verbosity(transformers.utils.logging.CRITICAL)
 
 IS_MULTIMODAL = {
     "Qwen/Qwen3.5-9B",
@@ -166,8 +178,15 @@ class TimedStreamer(TextStreamer):
         super().__init__(tokenizer, skip_prompt, **decode_kwargs)
 
     def put(self, value):
+        if self.next_tokens_are_prompt:
+            super().put(value)
+            return
         timers.token_gen.record()
         super().put(value)
+
+    def end(self):
+        timers.token_gen.reset_lap()
+        super().end()
 
 
 class CacheImpl(Enum):
