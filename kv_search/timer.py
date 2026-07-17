@@ -68,12 +68,12 @@ class Timers:
         table = Table(title="timings", title_justify="left")
         table.add_column("timer")
         table.add_column("total (s)", justify="right")
-        table.add_column("mean (s)", justify="right")
+        table.add_column("mean (ms)", justify="right")
         for f in fields(self):
             t: Timer = getattr(self, f.name)
             if t.count == 0:
                 continue
-            table.add_row(f.name, f"{t.total:.2f}", f"{t.mean:.2f}")
+            table.add_row(f.name, f"{t.total:.2f}", f"{t.mean * 1e3:.1f}")
         return table
 
 

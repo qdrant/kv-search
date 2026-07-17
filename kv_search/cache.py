@@ -2,10 +2,13 @@ import compression.zstd
 import json
 import math
 import types
+from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from pathlib import Path
 from typing import Annotated, BinaryIO, Callable, Literal, Protocol, Unpack
 
+import numpy as np
+import numpy.typing as npt
 import torch
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
@@ -119,66 +122,60 @@ class QdrantRetriever(BaseModel):
 
     @cached_property
     def _client(self) -> QdrantClient:
-        return QdrantClient(self.url, api_key=self.api_key)
+        return QdrantClient(self.url, api_key=self.api_key, prefer_grpc=True)
+
+    @cached_property
+    def _pool(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=4)
+
+    def _query_head(
+        self, layer_idx: int, head_idx: int, query_states: npt.NDArray
+    ) -> tuple[npt.NDArray, npt.NDArray]:
+        query_idx = head_idx * 4
+        data = self._client.query_batch_points(
+            collection_name=f"layer={layer_idx};head={head_idx}",
+            requests=[
+                QueryRequest(
+                    query=query_states[query_idx + i, token_idx],
+                    params=SearchParams(exact=True),
+                    with_payload=False,
+                    with_vector=True,
+                    using="key",
+                    limit=self.n_retrieved,
+                )
+                for token_idx in range(query_states.shape[1])
+                for i in range(4)
+            ],
+        )
+        keys = np.array(
+            [p.vector["key"] for r in data for p in r.points],  # ty:ignore[invalid-argument-type, not-subscriptable]
+            dtype=np.float32,
+        )
+        values = np.array(
+            [p.vector["value"] for r in data for p in r.points],  # ty:ignore[invalid-argument-type, not-subscriptable]
+            dtype=np.float32,
+        )
+        return keys, values
 
     def retrieve(
         self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
-    ):
-        cached_keys_per_head: list[torch.Tensor] = []
-        cached_values_per_head: list[torch.Tensor] = []
-        for head_idx in range(4):
-            query_idx = head_idx * 4
-            with timers.qdrant_retrieve:
-                data = self._client.query_batch_points(
-                    collection_name=f"layer={layer_idx};head={head_idx}",
-                    requests=[
-                        QueryRequest(
-                            query=query_states[0, query_idx + i, token_idx]
-                            .cpu()
-                            .to(torch.float)
-                            .numpy(),
-                            params=SearchParams(exact=True),
-                            with_payload=True,
-                            with_vector=True,
-                            using="key",
-                            limit=self.n_retrieved,
-                        )
-                        for token_idx in range(query_states.shape[2])
-                        for i in range(4)
-                    ],
-                )
-            with timers.qdrant_assemble:
-                cached_key_head: list[list[float]] = []
-                cached_value_head: list[list[float]] = []
-                for r in data:
-                    for p in r.points:
-                        assert isinstance(p.vector, dict)
-                        assert "key" in p.vector
-                        assert "value" in p.vector
-                        cached_key_head.append(p.vector["key"])  # ty:ignore[invalid-argument-type]
-                        cached_value_head.append(p.vector["value"])  # ty:ignore[invalid-argument-type]
-                cached_keys_per_head.append(
-                    torch.tensor(
-                        cached_key_head,
-                        dtype=query_states.dtype,
-                        device=query_states.device,
-                    )
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                )
-                cached_values_per_head.append(
-                    torch.tensor(
-                        cached_value_head,
-                        dtype=query_states.dtype,
-                        device=query_states.device,
-                    )
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                )
-        with timers.qdrant_assemble:
-            cached_keys = torch.cat(cached_keys_per_head, dim=1)
-            cached_values = torch.cat(cached_values_per_head, dim=1)
-        return cached_keys, cached_values
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query = query_states[0].to(torch.float32).cpu().numpy()
+        with timers.qdrant_retrieve:
+            results = list(
+                self._pool.map(lambda h: self._query_head(layer_idx, h, query), range(4))
+            )
+        keys = (
+            torch.from_numpy(np.stack([k for k, _ in results]))
+            .unsqueeze(0)
+            .to(query_states.device, query_states.dtype)
+        )
+        values = (
+            torch.from_numpy(np.stack([v for _, v in results]))
+            .unsqueeze(0)
+            .to(query_states.device, query_states.dtype)
+        )
+        return keys, values
 
 
 RetrieverConfig = Annotated[
@@ -385,7 +382,9 @@ def save_cache(
     context_len: int,
 ) -> None:
     (path / "meta.json").write_text(json.dumps({"context_len": context_len}))
-    for i, layer in track(enumerate(cache.layers), description="Writing to disk", total=len(cache.layers)):
+    for i, layer in track(
+        enumerate(cache.layers), description="Writing to disk", total=len(cache.layers)
+    ):
         tensors = _layer_to_dict(layer)
         blob = compression.zstd.compress(save(tensors))
         (path / f"layer_{i:02d}.safetensors.zst").write_bytes(blob)
