@@ -1,9 +1,9 @@
-import math
 import compression.zstd
 import json
+import math
 import types
 from pathlib import Path
-from typing import Callable, Protocol, Unpack, BinaryIO
+from typing import BinaryIO, Callable, Protocol, Unpack
 
 import torch
 from qdrant_client import QdrantClient
@@ -24,6 +24,8 @@ from transformers.models.gemma4_unified.modeling_gemma4_unified import (
 from transformers.models.ministral3.modeling_ministral3 import Ministral3Attention
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
+
+from kv_search.timer import timers
 
 
 class Retriever(Protocol):
@@ -356,6 +358,7 @@ def _unshuffle_bf16(u: torch.Tensor) -> torch.Tensor:
     )
 
 
+@timers.prefill_save
 def save_cache(
     cache: Cache,
     path: Path,
@@ -368,6 +371,7 @@ def save_cache(
         (path / f"layer_{i:02d}.safetensors.zst").write_bytes(blob)
 
 
+@timers.prefill_load
 def load_cache(
     path: Path, config: PretrainedConfig, device="cuda"
 ) -> tuple[DynamicCache, int]:
@@ -391,10 +395,13 @@ def load_cache(
     return cache, meta["context_len"]
 
 
-def _make_attention_mask(q_len: int, k_len: int, dtype, device) -> torch.Tensor | None:
+def _make_attention_mask(attn_impl: str, q_len: int, k_len: int, dtype, device) -> torch.Tensor | None:
     # Need to dynamically create our attention mask because transformers does not have sane defaults for causal/attention masks during inference
     # usually this is created beforehand, when the prompt is tokenized, but we don't know the context length then
     if q_len <= 1:
+        return None
+
+    if attn_impl not in ("sdpa", "eager"):
         return None
 
     attention_mask = torch.zeros(q_len, k_len, dtype=dtype, device=device)
@@ -447,6 +454,7 @@ def _qwen_3_5_forward(
         )
 
     attention_mask = _make_attention_mask(
+        self.config._attn_implementation,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,
@@ -504,6 +512,7 @@ def _qwen_2_5_forward(
         )
 
     attention_mask = _make_attention_mask(
+        self.config._attn_implementation,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,
@@ -568,6 +577,7 @@ def _ministral3_forward(
         )
 
     attention_mask = _make_attention_mask(
+        self.config._attn_implementation,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,
@@ -630,6 +640,7 @@ def _gemma3_forward(
         )
 
     attention_mask = _make_attention_mask(
+        self.config._attn_implementation,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,
@@ -711,6 +722,7 @@ def _gemma4_forward(
         )
 
     attention_mask = _make_attention_mask(
+        self.config._attn_implementation,
         query_states.shape[2],
         key_states.shape[2],
         query_states.dtype,

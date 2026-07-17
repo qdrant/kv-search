@@ -30,6 +30,7 @@ class Timer(BaseModel):
 class Timers(BaseModel):
     model_load: Timer = Timer(name="model_load")
     prefill_gen: Timer = Timer(name="prefill_gen")
+    prefill_save: Timer = Timer(name="prefill_save")
     prefill_load: Timer = Timer(name="prefill_load")
 
     token_gen_total: Timer = Timer(name="token_gen_total")

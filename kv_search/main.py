@@ -1,3 +1,4 @@
+import importlib.util
 from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
@@ -65,6 +66,12 @@ ModelName = Literal[
     "google/gemma-4-12B-it",
 ]
 
+_ATTN_IMPL = (
+    "flash_attention_2"
+    if importlib.util.find_spec("flash_attn") is not None
+    else "sdpa"
+)
+
 
 @timers.model_load
 def _load_model(model_name: ModelName) -> tuple[ModelType, ProcessorType]:
@@ -72,14 +79,14 @@ def _load_model(model_name: ModelName) -> tuple[ModelType, ProcessorType]:
     if model_name in IS_MULTIMODAL:
         model: ModelType = AutoModelForMultimodalLM.from_pretrained(
             model_name,
-            attn_implementation="sdpa",
+            attn_implementation=_ATTN_IMPL,
             dtype=torch.bfloat16,
             device_map="cuda",
         ).eval()
     else:
         model: ModelType = AutoModelForCausalLM.from_pretrained(
             model_name,
-            attn_implementation="sdpa",
+            attn_implementation=_ATTN_IMPL,
             dtype=torch.bfloat16,
             device_map="cuda",
         ).eval()
@@ -123,20 +130,24 @@ def _do_prefill(
                 model.device
             )
 
-        with torch.no_grad():
-            with torch.nn.attention.sdpa_kernel(
+        with (
+            torch.no_grad(),
+            torch.nn.attention.sdpa_kernel(
                 [
+                    torch.nn.attention.SDPBackend.CUDNN_ATTENTION,
                     torch.nn.attention.SDPBackend.FLASH_ATTENTION,
                     torch.nn.attention.SDPBackend.EFFICIENT_ATTENTION,
-                ]
-            ):
-                past_key_values = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **additional_args,
-                    past_key_values=past_key_values,
-                    logits_to_keep=1,
-                ).past_key_values
+                ],
+                set_priority=True,
+            ),
+        ):
+            past_key_values = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **additional_args,
+                past_key_values=past_key_values,
+                logits_to_keep=1,
+            ).past_key_values
 
 
 class CacheImpl(Enum):
@@ -171,6 +182,12 @@ class Prefill(BaseModel):
         )
         past_key_values.finalize()
         rich.print(timers)
+        rich.print(
+            f"peak allocated: {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB"
+        )
+        rich.print(
+            f"peak reserved:  {torch.cuda.max_memory_reserved() / 2**30:.2f} GiB"
+        )
 
 
 class Chat(BaseModel):

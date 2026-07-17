@@ -7,6 +7,7 @@ requires-python = ">=3.14"
 dependencies = [
     "accelerate>=1.14.0",
     "datasets>=4.8.5",
+    "flash-attn>=2.8.3.post1; sys_platform == 'linux'",
     "matplotlib>=3.11.0",
     "mistral-common>=1.11.3",
     "pillow>=12.2.0",
@@ -22,3 +23,14 @@ dependencies = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+extra-build-dependencies = { flash-attn = ["ninja"] }
+# This is somewhat nvidia spark specific but whatever
+extra-build-variables = { flash-attn = { MAX_JOBS = "16", FLASH_ATTN_CUDA_ARCHS = "120" } }
+
+[dependency-groups]
+dev = [
+    "ninja>=1.13.0",
+]
