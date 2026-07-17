@@ -1,17 +1,18 @@
 import compression.zstd
+import json
 import types
 from pathlib import Path
-from typing import Callable, Unpack
+from typing import Callable, Protocol, Unpack
 
 import torch
-from pydantic import BaseModel, Field, TypeAdapter
 from qdrant_client import QdrantClient
 from qdrant_client.models import QueryRequest, SearchParams
 from safetensors.torch import load, save
-from transformers import DynamicCache
+from transformers import PreTrainedConfig, PretrainedConfig
 from transformers.cache_utils import (
     Cache,
     CacheLayerMixin,
+    DynamicCache,
     LinearAttentionCacheLayerMixin,
 )
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
@@ -24,109 +25,23 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
 
-class LinearLayerState(BaseModel, arbitrary_types_allowed=True):
-    idx: int
-    conv_states: torch.Tensor
-    rec_states: torch.Tensor
-
-    def contiguous(self):
-        self.conv_states = self.conv_states.contiguous()
-        self.rec_states = self.rec_states.contiguous()
-        return self
+class Retriever(Protocol):
+    def retrieve(
+        self, query_states: torch.Tensor, layer_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return topk (keys, values) from prefill context for given queries."""
 
 
-class LayerState(BaseModel, arbitrary_types_allowed=True):
-    idx: int
-    queries: torch.Tensor
-    keys: torch.Tensor
-    values: torch.Tensor
-
-    def contiguous(self):
-        return self
+class FullContextRetriever:
+    pass
 
 
-LayerAdapter: TypeAdapter[LayerState | LinearLayerState] = TypeAdapter(
-    LayerState | LinearLayerState
-)
+class TopKRetriever:
+    def __init__(self, n_retrieved: int, prefill: DynamicCache):
+        self.prefill = prefill
+        self.n_retrieved = n_retrieved
 
-
-class CacheState(BaseModel, arbitrary_types_allowed=True):
-    context_len: int
-    layers: list[LayerState | LinearLayerState] = Field(default_factory=list)
-
-    def save(self, path: Path):
-        with (path / "meta.json").open("wt") as f:
-            f.write(self.model_dump_json(exclude={"layers"}))
-        for layer in self.layers:
-            with compression.zstd.open(
-                path / f"layer_{layer.idx:02d}_tensors.safetensors.zst", "wb"
-            ) as f:
-                tmp = layer.contiguous().model_dump()
-                tmp["idx"] = torch.tensor(tmp["idx"], dtype=torch.long)
-                f.write(save(tmp))
-
-    @classmethod
-    def load(cls, path: Path) -> CacheState:
-        with (path / "meta.json").open("rt") as f:
-            ret = cls.model_validate_json(f.read())
-
-        for p in sorted(list(path.glob("layer_*_tensors.safetensors.zst"))):
-            with compression.zstd.open(p, "rb") as f:
-                tmp = load(f.read())
-                tmp["idx"] = tmp["idx"].item()  # ty:ignore[invalid-assignment]
-                ret.layers.append(LayerAdapter.validate_python(tmp))
-
-        return ret
-
-
-class CutoffCache(DynamicCache):
-    cutoff: int | None
-    state: CacheState
-    layers: list[CacheLayerMixin | LinearAttentionCacheLayerMixin]
-
-    def __init__(self, cutoff: int | None = None, **kwargs):
-        super().__init__(**kwargs)
-        self.cutoff = cutoff
-        self.initial = True
-
-        self.scaling = 256**-0.5
-
-        self.state = CacheState.load(Path(f"cache/qdrant/qwen3_5/"))
-
-        assert len(self.state.layers) == len(self.layers)
-        for cached_layer in self.state.layers:
-            if isinstance(cached_layer, LinearLayerState):
-                cached_layer.conv_states = cached_layer.conv_states.cuda()
-                cached_layer.rec_states = cached_layer.rec_states.cuda()
-        self._restore_state()
-
-    def _restore_state(self):
-        for cached_layer, layer in zip(self.state.layers, self.layers):
-            if isinstance(cached_layer, LinearLayerState):
-                assert isinstance(layer, LinearAttentionCacheLayerMixin)
-                if not (
-                    layer.is_conv_states_initialized
-                    and layer.is_recurrent_states_initialized
-                ):
-                    layer.lazy_initialization(
-                        cached_layer.conv_states, cached_layer.rec_states
-                    )
-                layer.conv_states.copy_(cached_layer.conv_states)
-                layer.recurrent_states.copy_(cached_layer.rec_states)
-                layer.has_previous_state = True
-            elif layer.is_initialized:
-                layer.keys = torch.tensor(
-                    [], dtype=layer.keys.dtype, device=layer.keys.device
-                )
-                layer.values = torch.tensor(
-                    [], dtype=layer.values.dtype, device=layer.values.device
-                )
-
-    def reset(self):
-        super().reset()
-        self._restore_state()
-
-    def repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
         """
         This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
         num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
@@ -139,7 +54,7 @@ class CutoffCache(DynamicCache):
         )
         return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-    def eager_attention_forward(
+    def _eager_attention_forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -147,7 +62,7 @@ class CutoffCache(DynamicCache):
         attention_mask: torch.Tensor | None = None,
         softcap: float | None = None,
     ) -> torch.Tensor:
-        key_states = self.repeat_kv(key, 4)
+        key_states = self._repeat_kv(key, 4)
 
         attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
 
@@ -164,108 +79,123 @@ class CutoffCache(DynamicCache):
 
         return attn_weights
 
-    def update(
+    def retrieve(
         self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
+        query_states: torch.Tensor,
         layer_idx: int,
-        *args,
-        query_states: torch.Tensor | None = None,
-        **kwargs,
     ):
-        layer_state = self.state.layers[layer_idx]
-        assert isinstance(layer_state, LayerState)
-        layer_state.keys = layer_state.keys.to(key_states.device)
-        layer_state.values = layer_state.values.to(value_states.device)
+        layer = self.prefill.layers[layer_idx]
+        assert isinstance(layer, CacheLayerMixin)
+        assert layer.keys is not None
+        assert layer.values is not None
 
-        cache_keys = layer_state.keys[:, :, : self.state.context_len, :]
-        cache_values = layer_state.values[:, :, : self.state.context_len, :]
+        s = self._eager_attention_forward(query_states, layer.keys, scaling=1)
+        _, idx = torch.topk(s, self.n_retrieved, dim=-1)
+        idx = idx.reshape((1, 4, -1, 1))
 
-        keys, values = super().update(
-            key_states, value_states, layer_idx, *args, **kwargs
-        )
-
-        if query_states is not None:
-            if self.cutoff is None:
-                return torch.cat([cache_keys, keys], dim=2), torch.cat(
-                    [cache_values, values], dim=2
-                )
-
-            s = self.eager_attention_forward(
-                query_states, cache_keys, scaling=self.scaling
-            )
-            # print(f"{self.cutoff=}")
-            # print(f"{s.shape=}")
-            _, idx = torch.topk(s, self.cutoff, dim=-1)
-            idx, _ = idx.reshape((1, 4, -1, 1)).sort(dim=2)
-            # idx = idx.to(keys.device)
-
-            keys = torch.cat([cache_keys.take_along_dim(idx, dim=2), keys], dim=2)
-            values = torch.cat(
-                [cache_values.take_along_dim(idx, dim=2), values],
-                dim=2,
-            )
-
-            if self.initial:
-                print(f"{idx.shape=}")
-                print(f"{idx=}")
-                print(f"{keys.shape=}")
-                print(f"{key_states.shape=}")
-                print(f"{query_states.shape[2] * 128 * 4=}")
-                self.initial = False
+        keys = layer.keys.take_along_dim(idx, dim=2)
+        values = layer.values.take_along_dim(idx, dim=2)
 
         return keys, values
 
 
-class QdrantCache(DynamicCache):
-    """
-    Drop-in replacement for DynamicCache. Receives query states inside update()
-    so they can eventually influence which K/V pairs are returned.
+class QdrantRetriever:
+    def __init__(self, client: QdrantClient, n_retrieved: int):
+        self.n_retrieved = n_retrieved
+        self.client = client
 
-    Captured queries are stored in self.query_states[layer_idx] as a list of
-    tensors (one per forward call), shape [batch, heads, seq_len, head_dim].
-    """
-
-    client: QdrantClient
-
-    def __init__(self, url: str, **kwargs):
-        super().__init__(**kwargs)
-        self.client = QdrantClient(url)
-        self.initial = True
-
-        self.state = CacheState.load(Path(f"cache/qdrant/qwen3_5/"))
-
-        assert len(self.state.layers) == len(self.layers)
-        for cached_layer in self.state.layers:
-            if isinstance(cached_layer, LinearLayerState):
-                cached_layer.conv_states = cached_layer.conv_states.cuda()
-                cached_layer.rec_states = cached_layer.rec_states.cuda()
-            else:
-                cached_layer.keys = torch.tensor(
-                    [], dtype=cached_layer.keys.dtype, device=cached_layer.keys.device
+    def retrieve(
+        self,
+        query_states: torch.Tensor,
+        layer_idx: int,
+    ):
+        cached_keys_per_head: list[torch.Tensor] = []
+        cached_values_per_head: list[torch.Tensor] = []
+        for head_idx in range(4):
+            query_idx = head_idx * 4
+            data = self.client.query_batch_points(
+                collection_name=f"layer={layer_idx};head={head_idx}",
+                requests=[
+                    QueryRequest(
+                        query=query_states[0, query_idx + i, token_idx]
+                        .cpu()
+                        .to(torch.float)
+                        .numpy(),
+                        params=SearchParams(exact=True),
+                        with_payload=True,
+                        with_vector=True,
+                        using="key",
+                        limit=self.n_retrieved,
+                    )
+                    for token_idx in range(query_states.shape[2])
+                    for i in range(4)
+                ],
+            )
+            cached_key_head: list[list[float]] = []
+            cached_value_head: list[list[float]] = []
+            for r in data:
+                for p in r.points:
+                    assert isinstance(p.vector, dict)
+                    assert "key" in p.vector
+                    assert "value" in p.vector
+                    cached_key_head.append(p.vector["key"])
+                    cached_value_head.append(p.vector["value"])
+            cached_keys_per_head.append(
+                torch.tensor(
+                    cached_key_head,
+                    dtype=query_states.dtype,
+                    device=query_states.device,
                 )
-                cached_layer.values = torch.tensor(
-                    [],
-                    dtype=cached_layer.values.dtype,
-                    device=cached_layer.values.device,
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
+            cached_values_per_head.append(
+                torch.tensor(
+                    cached_value_head,
+                    dtype=query_states.dtype,
+                    device=query_states.device,
                 )
+                .unsqueeze(0)
+                .unsqueeze(0)
+            )
+        cached_keys = torch.cat(cached_keys_per_head, dim=1)
+        cached_values = torch.cat(cached_values_per_head, dim=1)
+        return cached_keys, cached_values
+
+
+class RetrievalCache(DynamicCache):
+    def __init__(
+        self,
+        retriever: Retriever,
+        prefill: DynamicCache,
+        config: PreTrainedConfig | None = None,
+    ):
+        super().__init__(config=config)
+        self.retriever = retriever
+        self.prefill = prefill
         self._restore_state()
 
     def _restore_state(self):
-        for cached_layer, layer in zip(self.state.layers, self.layers):
-            if isinstance(cached_layer, LinearLayerState):
-                assert isinstance(layer, LinearAttentionCacheLayerMixin)
+        for cached_layer, layer in zip(self.prefill.layers, self.layers):
+            if isinstance(layer, LinearAttentionCacheLayerMixin):
+                assert isinstance(cached_layer, LinearAttentionCacheLayerMixin)
                 if not (
                     layer.is_conv_states_initialized
                     and layer.is_recurrent_states_initialized
                 ):
                     layer.lazy_initialization(
-                        cached_layer.conv_states, cached_layer.rec_states
+                        cached_layer.conv_states, cached_layer.recurrent_states
                     )
+                assert layer.conv_states is not None
+                assert layer.recurrent_states is not None
+                assert cached_layer.conv_states is not None
+                assert cached_layer.recurrent_states is not None
                 layer.conv_states.copy_(cached_layer.conv_states)
-                layer.recurrent_states.copy_(cached_layer.rec_states)
+                layer.recurrent_states.copy_(cached_layer.recurrent_states)
                 layer.has_previous_state = True
             elif layer.is_initialized:
+                assert layer.keys is not None
+                assert layer.values is not None
                 layer.keys = torch.tensor(
                     [], dtype=layer.keys.dtype, device=layer.keys.device
                 )
@@ -286,87 +216,21 @@ class QdrantCache(DynamicCache):
         query_states: torch.Tensor | None = None,
         **kwargs,
     ):
-
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
         )
 
-        cached_idx_per_head: list[torch.Tensor] = []
-        cached_keys_per_head: list[torch.Tensor] = []
-        cached_values_per_head: list[torch.Tensor] = []
         if query_states is not None:
-            for head_idx in range(key_states.shape[1]):
-                query_idx = head_idx * 4
-                data = self.client.query_batch_points(
-                    collection_name=f"layer={layer_idx};head={head_idx}",
-                    requests=[
-                        QueryRequest(
-                            query=query_states[0, query_idx + i, token_idx]
-                            .cpu()
-                            .to(torch.float)
-                            .numpy(),
-                            params=SearchParams(exact=True),
-                            with_payload=True,
-                            with_vector=True,
-                            using="key",
-                            limit=128,
-                        )
-                        for token_idx in range(query_states.shape[2])
-                        for i in range(4)
-                    ],
-                )
-                cached_key_head: list[list[float]] = []
-                cached_value_head: list[list[float]] = []
-                # cached_idx_head: list[int] = []
-                for r in data:
-                    for p in r.points:
-                        assert isinstance(p.vector, dict)
-                        assert "key" in p.vector
-                        assert "value" in p.vector
-                        cached_key_head.append(p.vector["key"])
-                        cached_value_head.append(p.vector["value"])
-                        # cached_idx_head.append(p.id)
-                # cached_idx_per_head.append(
-                #     torch.tensor(cached_idx_head, dtype=torch.long, device=keys.device)
-                #     .unsqueeze(0)
-                #     .unsqueeze(0)
-                # )
-                cached_keys_per_head.append(
-                    torch.tensor(cached_key_head, dtype=keys.dtype, device=keys.device)
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                )
-                cached_values_per_head.append(
-                    torch.tensor(
-                        cached_value_head, dtype=keys.dtype, device=keys.device
-                    )
-                    .unsqueeze(0)
-                    .unsqueeze(0)
-                )
-            cached_keys = torch.cat(cached_keys_per_head, dim=1)
-            cached_values = torch.cat(cached_values_per_head, dim=1)
-            # cached_idx = torch.cat(cached_idx_per_head, dim=1)
-        keys = torch.cat(
-            [cached_keys, keys],
-            dim=2,
-        )
-        values = torch.cat(
-            [cached_values, values],
-            dim=2,
-        )
+            cached_keys, cached_values = self.retriever.retrieve(
+                query_states, layer_idx
+            )
+            keys = torch.cat([cached_keys, keys], dim=2)
+            values = torch.cat([cached_values, values], dim=2)
 
         return keys, values
 
 
-class QueryAwareCache(DynamicCache):
-    """
-    Drop-in replacement for DynamicCache. Receives query states inside update()
-    so they can eventually influence which K/V pairs are returned.
-
-    Captured queries are stored in self.query_states[layer_idx] as a list of
-    tensors (one per forward call), shape [batch, heads, seq_len, head_dim].
-    """
-
+class RecordingCache(DynamicCache):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.queries: list[torch.Tensor | None] = [None] * len(self.layers)
@@ -384,24 +248,94 @@ class QueryAwareCache(DynamicCache):
                     [self.queries[layer_idx], query_states.detach().cpu()], dim=-2
                 )
 
-        # Bring current layer back to GPU if offloaded
-        # if layer_idx < len(self.layers):
-        #     layer = self.layers[layer_idx]
-        #     if layer.is_initialized and layer.keys.device != key_states.device:
-        #         layer.keys = layer.keys.to(key_states.device)
-        #         layer.values = layer.values.to(key_states.device)
-
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
         )
-
-        # layer = self.layers[layer_idx]
-
-        # # Offload to CPU after update
-        # layer.keys = layer.keys.to("cpu")
-        # layer.values = layer.values.to("cpu")
-
         return keys, values
+
+
+def _layer_to_dict(
+    layer: CacheLayerMixin | LinearAttentionCacheLayerMixin,
+) -> dict[str, torch.Tensor]:
+    tensors = {}
+    if isinstance(layer, LinearAttentionCacheLayerMixin):
+        assert layer.conv_states is not None
+        assert layer.recurrent_states is not None
+        tensors["conv_states"] = _shuffle_bf16(layer.conv_states)
+        tensors["recurrent_states"] = _shuffle_bf16(layer.recurrent_states)
+    else:
+        assert layer.keys is not None
+        assert layer.values is not None
+        tensors["keys"] = _shuffle_bf16(layer.keys)
+        tensors["values"] = _shuffle_bf16(layer.values)
+
+    return tensors
+
+
+# dirty byte tricks so it compresses better
+def _shuffle_bf16(t: torch.Tensor) -> torch.Tensor:
+    return (
+        t.contiguous()
+        .view(torch.uint8)
+        .reshape(-1, 2)
+        .t()
+        .contiguous()
+        .reshape(2, *t.shape)
+    )
+
+
+def _unshuffle_bf16(u: torch.Tensor) -> torch.Tensor:
+    return (
+        u.reshape(2, -1)
+        .t()
+        .contiguous()
+        .flatten()
+        .view(torch.bfloat16)
+        .reshape(u.shape[1:])
+    )
+
+
+def save_cache(
+    cache: Cache,
+    path: Path,
+    context_len: int,
+    queries: list[torch.Tensor | None] | None = None,
+) -> None:
+    (path / "meta.json").write_text(json.dumps({"context_len": context_len}))
+    for i, layer in enumerate(cache.layers):
+        tensors = _layer_to_dict(layer)
+        blob = compression.zstd.compress(save(tensors))
+        (path / f"layer_{i:02d}.safetensors.zst").write_bytes(blob)
+
+    if queries is not None:
+        tensors = {
+            str(i): _shuffle_bf16(v) for i, v in enumerate(queries) if v is not None
+        }
+        blob = compression.zstd.compress(save(tensors))
+        (path / "queries.safetensors.zst").write_bytes(blob)
+
+
+def load_cache(
+    path: Path, config: PretrainedConfig, device="cuda"
+) -> tuple[DynamicCache, int]:
+    cache = DynamicCache(config=config)
+    meta = json.loads((path / "meta.json").read_text())
+
+    files = sorted(path.glob("layer_*.safetensors.zst"))
+    assert len(files) == len(cache.layers)
+    for layer, file in zip(cache.layers, files):
+        tensors = load(compression.zstd.decompress(file.read_bytes()))
+        for k, v in tensors.items():
+            tensors[k] = _unshuffle_bf16(v).to(device, non_blocking=True)
+        if isinstance(layer, LinearAttentionCacheLayerMixin):
+            layer.update_conv_state(tensors["conv_states"])
+            layer.update_recurrent_state(tensors["conv_states"])
+        else:
+            layer.lazy_initialization(tensors["keys"], tensors["values"])
+            layer.keys = tensors["keys"]
+            layer.values = tensors["values"]
+
+    return cache, meta["context_len"]
 
 
 def _make_attention_mask(

@@ -1,8 +1,10 @@
+from enum import Enum, auto
 from pathlib import Path
 from typing import Literal
 
-import rich
 import torch
+from pydantic import BaseModel
+from pydantic_settings import CliApp, CliSubCommand
 from rich.progress import track
 from transformers import (
     AutoModelForCausalLM,
@@ -19,17 +21,13 @@ from transformers import (
     Qwen2Tokenizer,
     Qwen3_5ForConditionalGeneration,
     Qwen3VLProcessor,
-    TextStreamer,
 )
-from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
 
 from kv_search.data import Datasets, Message, load_dataset
 from kv_search.query_aware_cache import (
-    CacheState,
-    LayerState,
-    LinearLayerState,
-    QueryAwareCache,
+    RecordingCache,
     bind_query_aware_cache,
+    save_cache,
 )
 
 IS_MULTIMODAL = {
@@ -47,6 +45,7 @@ ModelType = (
     | Gemma3ForConditionalGeneration
     | Gemma4ForConditionalGeneration
 )
+
 ProcessorType = (
     Qwen3VLProcessor
     | Qwen2Tokenizer
@@ -56,11 +55,47 @@ ProcessorType = (
 )
 
 
+ModelName = Literal[
+    "Qwen/Qwen3.5-9B",
+    "Qwen/Qwen2.5-7B",
+    "mistralai/Ministral-3-8B-Instruct-2512",
+    "google/gemma-3-4b-it",
+    "google/gemma-4-12B-it",
+]
+
+
+def _load_model(model_name: ModelName) -> tuple[ModelType, ProcessorType]:
+    processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
+    if model_name in IS_MULTIMODAL:
+        model: ModelType = (
+            AutoModelForMultimodalLM.from_pretrained(
+                model_name,
+                attn_implementation="sdpa",
+                dtype=torch.bfloat16,
+            )
+            .cuda()
+            .eval()
+        )
+    else:
+        model: ModelType = (
+            AutoModelForCausalLM.from_pretrained(
+                model_name,
+                attn_implementation="sdpa",
+                dtype=torch.bfloat16,
+            )
+            .cuda()  # ty:ignore[missing-argument]
+            .eval()
+        )
+
+    bind_query_aware_cache(model)
+    return model, processor
+
+
 def _do_prefill(
     messages: Message,
     model: ModelType,
     processor: ProcessorType,
-    past_key_values: QueryAwareCache,
+    past_key_values: RecordingCache,
 ):
     inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
         messages.prefill,
@@ -106,104 +141,61 @@ def _do_prefill(
                 ).past_key_values
 
 
-def main(
-    model_name: Literal[
-        "Qwen/Qwen3.5-9B",
-        "Qwen/Qwen2.5-7B",
-        "mistralai/Ministral-3-8B-Instruct-2512",
-        "google/gemma-3-4b-it",
-        "google/gemma-4-12B-it",
-    ],
-    dataset_name: Datasets,
-):
-    processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
-    if model_name in IS_MULTIMODAL:
-        model: ModelType = (
-            AutoModelForMultimodalLM.from_pretrained(
-                model_name,
-                attn_implementation="sdpa",
-                dtype=torch.bfloat16,
-            )
-            .cuda()
-            .eval()
+class CacheImpl(Enum):
+    TORCH = auto()
+    QDRANT = auto()
+
+
+class Prefill(BaseModel):
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+    upsert: bool = False
+    qdrant_url: str = "localhost"
+    qdrant_api_key: str | None = None
+
+    def cli_cmd(self) -> None:
+        model, processor = _load_model(self.model_name)
+        past_key_values = RecordingCache(config=model.config)
+        messages = load_dataset(
+            self.dataset_name, multimodal=self.model_name in IS_MULTIMODAL
         )
-    else:
-        model: ModelType = (
-            AutoModelForCausalLM.from_pretrained(
-                model_name,
-                attn_implementation="sdpa",
-                dtype=torch.bfloat16,
-            )
-            .cuda()
-            .eval()
-        )  # ty:ignore[missing-argument]
 
-    bind_query_aware_cache(model)
-    past_key_values = QueryAwareCache(config=model.config)
+        _do_prefill(messages, model, processor, past_key_values)
 
-    streamer = TextStreamer(processor.tokenizer)
+        cache_dir = Path(f"cache/{self.dataset_name}/{model.config.model_type}")
+        cache_dir.mkdir(exist_ok=True, parents=True)
+        save_cache(
+            past_key_values,
+            cache_dir,
+            past_key_values.get_seq_length(),
+            past_key_values.queries,
+        )
 
-    messages = load_dataset(dataset_name, multimodal=model_name in IS_MULTIMODAL)
 
-    _do_prefill(messages, model, processor, past_key_values)
+class Chat(BaseModel):
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+    cache_impl: CacheImpl = CacheImpl.QDRANT
+    n_retrieved: int | None = 128
+    max_new_tokens: int = 256
+    qdrant_url: str = "localhost"
+    qdrant_api_key: str | None = None
 
-    print(f"{past_key_values.get_seq_length()=}")
-    prefill_length = past_key_values.get_seq_length()
+    def cli_cmd(self) -> None:
+        raise NotImplementedError
 
-    rich.print(messages.query)
-    inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
-        messages.query,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-        enable_thinking=False,
-    )  # ty:ignore[invalid-assignment]
-    inputs["attention_mask"] = torch.cat(
-        [
-            torch.ones(1, past_key_values.get_seq_length(), dtype=torch.long),
-            inputs["attention_mask"],
-        ],
-        dim=1,
-    )
-    inputs = inputs.to(model.device)
 
-    outputs = model.generate(
-        **inputs,  # ty:ignore[invalid-argument-type]
-        max_new_tokens=256,
-        past_key_values=past_key_values,
-        use_cache=True,
-        streamer=streamer,
-    )  # ty:ignore[invalid-argument-type]
-    print(processor.decode(outputs[0][inputs["input_ids"].shape[-1] :]))
-    print(f"{past_key_values.get_seq_length()=}")
+class KvSearch(BaseModel):
+    prefill: CliSubCommand[Prefill]
+    chat: CliSubCommand[Chat]
 
-    state = CacheState(context_len=prefill_length, layers=[])
-    for i, layer in enumerate(past_key_values.layers):
-        match layer:
-            case CacheLayerMixin(keys=keys, values=values):
-                state.layers.append(
-                    LayerState(
-                        idx=i,
-                        queries=past_key_values.queries[i],
-                        keys=keys,
-                        values=values,
-                    )
-                )
-            case LinearAttentionCacheLayerMixin(
-                conv_states=conv_states, recurrent_states=rec_states
-            ):
-                state.layers.append(
-                    LinearLayerState(
-                        idx=i, conv_states=conv_states, rec_states=rec_states
-                    )
-                )
+    def cli_cmd(self) -> None:
+        CliApp.run_subcommand(self)
 
-    cache_dir = Path(f"cache/{dataset_name}/{model.config.model_type}")
-    cache_dir.mkdir(exist_ok=True, parents=True)
 
-    state.save(cache_dir)
+def main() -> None:
+    CliApp.run(KvSearch)
 
 
 if __name__ == "__main__":
-    main("Qwen/Qwen3.5-9B", dataset_name=Datasets.QDRANT)
+    main()
