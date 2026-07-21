@@ -1,9 +1,14 @@
 import contextlib
 import io
 import os
+import shutil
+import tempfile
 
+import qdrant_edge as edge
+import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import Batch, Distance, HnswConfigDiff, VectorParams
+from qdrant_client.qdrant_remote import QdrantRemote
 from transformers.cache_utils import CacheLayerMixin
 
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
@@ -171,8 +176,14 @@ def _do_prefill(
             ).past_key_values
 
 
-def _upsert(cache: RecordingCache, client: QdrantClient, batch_size: int = 128):
-    for i, layer in track(enumerate(cache.layers), description="Upserting", total=len(cache.layers)):
+def _upsert(
+    cache: RecordingCache, url: str, batch_size: int = 128, api_key: str | None = None
+):
+    client = QdrantClient(url, api_key=api_key)
+    assert isinstance(client._client, QdrantRemote)
+    for i, layer in track(
+        enumerate(cache.layers), description="Upserting", total=len(cache.layers)
+    ):
         if not isinstance(layer, CacheLayerMixin):
             continue
 
@@ -219,6 +230,27 @@ def _upsert(cache: RecordingCache, client: QdrantClient, batch_size: int = 128):
                         },
                     ),
                 )
+
+            shard_dir = Path("cache") / "edge" / f"layer{i:02d}_head{h}"
+
+            with tempfile.TemporaryDirectory(dir=shard_dir.parent) as restore_dir:
+                snapshot_path = Path(restore_dir) / "shard.snapshot"
+
+                with requests.get(
+                    f"{client._client.rest_uri}/collections/layer={i};head={h}/shards/0/snapshot",
+                    headers={"api-key": api_key} if api_key else None,
+                    stream=True,
+                ) as r:
+                    r.raise_for_status()
+                    with open(snapshot_path, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            f.write(chunk)
+
+                if shard_dir.exists():
+                    shutil.rmtree(shard_dir)
+                shard_dir.mkdir(parents=True, exist_ok=True)
+
+                edge.EdgeShard.unpack_snapshot(str(snapshot_path), str(shard_dir))
 
 
 def _print_stats():
@@ -283,8 +315,7 @@ class CmdPrefill(BaseModel):
         cache.finalize()
 
         if self.upsert:
-            client = QdrantClient(self.url, api_key=self.api_key)
-            _upsert(cache, client, self.upsert_batch_size)
+            _upsert(cache, self.url, self.upsert_batch_size, api_key=self.api_key)
 
         _print_stats()
 

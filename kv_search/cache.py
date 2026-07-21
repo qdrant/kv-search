@@ -9,8 +9,9 @@ from typing import Annotated, BinaryIO, Callable, Literal, Protocol, Unpack
 
 import numpy as np
 import numpy.typing as npt
+import qdrant_edge as edge
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 from qdrant_client import QdrantClient
 from qdrant_client.models import QueryRequest, SearchParams
 from rich.progress import track
@@ -163,7 +164,9 @@ class QdrantRetriever(BaseModel):
         query = query_states[0].to(torch.float32).cpu().numpy()
         with timers.qdrant_retrieve:
             results = list(
-                self._pool.map(lambda h: self._query_head(layer_idx, h, query), range(4))
+                self._pool.map(
+                    lambda h: self._query_head(layer_idx, h, query), range(4)
+                )
             )
         keys = (
             torch.from_numpy(np.stack([k for k, _ in results]))
@@ -178,8 +181,80 @@ class QdrantRetriever(BaseModel):
         return keys, values
 
 
+class QdrantEdgeRetriever(BaseModel):
+    type: Literal["edge"] = "edge"
+    n_retrieved: int = 128
+
+    _shards: dict[tuple[int, int], edge.EdgeShard] = PrivateAttr(default_factory=dict)
+
+    def _shard(self, layer_idx: int, head_idx: int) -> edge.EdgeShard:
+        key = (layer_idx, head_idx)
+        if key in self._shards:
+            return self._shards[key]
+        shard = edge.EdgeShard.load(f"cache/edge/layer{layer_idx:02d}_head{head_idx}")
+        self._shards[key] = shard
+        return shard
+
+    @cached_property
+    def _pool(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(max_workers=4)
+
+    def _query_head(
+        self, layer_idx: int, head_idx: int, query_states: npt.NDArray
+    ) -> tuple[npt.NDArray, npt.NDArray]:
+        query_idx = head_idx * 4
+        data = [
+            self._shard(layer_idx, head_idx).query(
+                edge.QueryRequest(
+                    query=edge.Query.Nearest(
+                        query=query_states[query_idx + i, token_idx], using="key"
+                    ),
+                    params=edge.SearchParams(exact=True),
+                    with_payload=False,
+                    with_vector=True,
+                    limit=self.n_retrieved,
+                )
+            )
+            for token_idx in range(query_states.shape[1])
+            for i in range(4)
+        ]
+        keys = np.array(
+            [p.vector["key"] for r in data for p in r],  # ty:ignore[invalid-argument-type, not-subscriptable]
+            dtype=np.float32,
+        )
+        values = np.array(
+            [p.vector["value"] for r in data for p in r],  # ty:ignore[invalid-argument-type, not-subscriptable]
+            dtype=np.float32,
+        )
+        return keys, values
+
+    def retrieve(
+        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query = query_states[0].to(torch.float32).cpu().numpy()
+        with timers.qdrant_retrieve:
+            # results = list(
+            #     self._pool.map(
+            #         lambda h: self._query_head(layer_idx, h, query), range(4)
+            #     )
+            # )
+            results = [self._query_head(layer_idx, h, query) for h in range(4)]
+        keys = (
+            torch.from_numpy(np.stack([k for k, _ in results]))
+            .unsqueeze(0)
+            .to(query_states.device, query_states.dtype)
+        )
+        values = (
+            torch.from_numpy(np.stack([v for _, v in results]))
+            .unsqueeze(0)
+            .to(query_states.device, query_states.dtype)
+        )
+        return keys, values
+
+
 RetrieverConfig = Annotated[
-    TopKRetriever | FullContextRetriever | QdrantRetriever, Field(discriminator="type")
+    TopKRetriever | FullContextRetriever | QdrantRetriever | QdrantEdgeRetriever,
+    Field(discriminator="type"),
 ]
 
 
