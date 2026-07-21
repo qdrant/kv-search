@@ -1,15 +1,17 @@
-use pyo3::pymodule;
+use pyo3::prelude::*;
 
 #[pymodule]
 mod _native {
     use std::{collections::HashMap, path::Path};
 
-    use numpy::{PyArray2, PyArray3, PyReadonlyArray3, PyReadonlyArrayDyn, ndarray::s};
-    use pyo3::{Bound, PyResult, Python, exceptions::PyRuntimeError, pyclass, pymethods};
+    use numpy::{PyArray3, PyReadonlyArray3, ndarray::s};
+    use pyo3::exceptions::PyRuntimeError;
+    use pyo3::prelude::*;
     use qdrant_edge::{
-        EdgeShard, NamedQuery, OperationError, QueryEnum, QueryRequest, ScoredPoint, ScoringQuery,
-        VectorInternal, VectorStructInternal, WithPayloadInterface, WithVector,
+        EdgeShard, NamedQuery, QueryEnum, QueryRequest, ScoringQuery, VectorInternal,
+        VectorStructInternal, WithPayloadInterface, WithVector,
     };
+    use rayon::prelude::*;
 
     #[pyclass]
     struct NativeEdgeRetriever {
@@ -39,7 +41,6 @@ mod _native {
             q: PyReadonlyArray3<'_, f32>, // [16, q_len, 256]
             limit: usize,
         ) -> PyResult<(Bound<'py, PyArray3<f32>>, Bound<'py, PyArray3<f32>>)> {
-            // [4, 4 * q_len * lim, 256]
             let arr = q.as_array();
             let q_heads = arr.shape()[0];
             let q_len = arr.shape()[1];
@@ -48,12 +49,11 @@ mod _native {
                 .flat_map(|qh| (0..q_len).map(move |t| (qh / 4, arr.slice(s![qh, t, ..]).to_vec())))
                 .collect();
 
-            let points: Vec<(usize, Vec<ScoredPoint>)> = queries
-                .into_iter()
+            let per_query: Vec<(usize, Vec<Vec<f32>>, Vec<Vec<f32>>)> = queries
+                .into_par_iter()
                 .map(|(h, qv)| {
-                    Ok((
-                        h,
-                        (&self.shards[&(layer_idx, h)]).query(QueryRequest {
+                    let points = self.shards[&(layer_idx, h)]
+                        .query(QueryRequest {
                             prefetches: vec![],
                             query: Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery {
                                 query: qv.into(),
@@ -66,30 +66,36 @@ mod _native {
                             params: None,
                             with_vector: WithVector::Bool(true),
                             with_payload: WithPayloadInterface::Bool(false),
-                        })?,
-                    ))
+                        })
+                        .map_err(|e| e.to_string())?;
+
+                    let mut keys: Vec<Vec<f32>> = Vec::with_capacity(points.len());
+                    let mut values: Vec<Vec<f32>> = Vec::with_capacity(points.len());
+                    for p in points {
+                        let Some(VectorStructInternal::Named(mut named)) = p.vector else {
+                            return Err("scored point has no named vectors".to_string());
+                        };
+
+                        match (named.remove("key"), named.remove("value")) {
+                            (Some(VectorInternal::Dense(k)), Some(VectorInternal::Dense(v))) => {
+                                keys.push(k);
+                                values.push(v);
+                            }
+                            _ => return Err("blah".to_string()),
+                        }
+                    }
+                    Ok((h, keys, values))
                 })
-                .collect::<Result<Vec<_>, OperationError>>()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                .collect::<Result<Vec<_>, String>>()
+                .map_err(|e| PyRuntimeError::new_err(e))?;
 
             let n_kv = q_heads / 4;
             let mut keys: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_kv];
             let mut values: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_kv];
 
-            for (kv, ps) in points {
-                for p in ps {
-                    let Some(VectorStructInternal::Named(mut named)) = p.vector else {
-                        return Err(PyRuntimeError::new_err("scored point has no named vectors"));
-                    };
-
-                    match (named.remove("key"), named.remove("value")) {
-                        (Some(VectorInternal::Dense(k)), Some(VectorInternal::Dense(v))) => {
-                            keys[kv].push(k);
-                            values[kv].push(v);
-                        }
-                        _ => return Err(PyRuntimeError::new_err("blah")),
-                    }
-                }
+            for (kv, k, v) in per_query {
+                keys[kv].extend(k);
+                values[kv].extend(v);
             }
 
             let keys = PyArray3::from_vec3(py, &keys)?;

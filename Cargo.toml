@@ -11,3 +11,4 @@ crate-type = ["cdylib"]
 numpy = "0.29.0"
 pyo3 = { version = "0.29.0", features = ["abi3-py313"] }
 qdrant-edge = "0.7.2"
+rayon = "1.12.0"
