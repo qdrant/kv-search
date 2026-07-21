@@ -33,6 +33,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
 from kv_search.timer import timers
+from kv_search._native import NativeEdgeRetriever
 
 
 class Retriever(Protocol):
@@ -181,6 +182,73 @@ class QdrantRetriever(BaseModel):
         return keys, values
 
 
+class QdrantEdgeNativeRetriever(BaseModel):
+    type: Literal["native"] = "native"
+    n_retrieved: int = 128
+
+    @cached_property
+    def _engine(self) -> NativeEdgeRetriever:
+        return NativeEdgeRetriever(
+            [
+                (
+                    (layer_idx, head_idx),
+                    f"cache/edge/layer{layer_idx:02d}_head{head_idx}",
+                )
+                for layer_idx in range(3, 32, 4)
+                for head_idx in range(4)
+            ]
+        )
+
+    def _query_head(
+        self, layer_idx: int, head_idx: int, query_states: npt.NDArray
+    ) -> tuple[npt.NDArray, npt.NDArray]:
+        query_idx = head_idx * 4
+        data = [
+            self._engine.retrieve(
+                layer_idx,
+                head_idx,
+                query_states[query_idx + i, token_idx],
+                limit=self.n_retrieved,
+            )
+            for token_idx in range(query_states.shape[1])
+            for i in range(4)
+        ]
+        keys = np.concat(
+            [k for k, _ in data],
+            axis=0,
+            dtype=np.float32,
+        )
+        values = np.concat(
+            [v for _, v in data],
+            axis=0,
+            dtype=np.float32,
+        )
+        return keys, values
+
+    def retrieve(
+        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        query = query_states[0].to(torch.float32).cpu().numpy()
+        with timers.qdrant_retrieve:
+            # results = list(
+            #     self._pool.map(
+            #         lambda h: self._query_head(layer_idx, h, query), range(4)
+            #     )
+            # )
+            results = [self._query_head(layer_idx, h, query) for h in range(4)]
+        keys = (
+            torch.from_numpy(np.stack([k for k, _ in results]))
+            .unsqueeze(0)
+            .to(query_states.device, query_states.dtype)
+        )
+        values = (
+            torch.from_numpy(np.stack([v for _, v in results]))
+            .unsqueeze(0)
+            .to(query_states.device, query_states.dtype)
+        )
+        return keys, values
+
+
 class QdrantEdgeRetriever(BaseModel):
     type: Literal["edge"] = "edge"
     n_retrieved: int = 128
@@ -194,10 +262,6 @@ class QdrantEdgeRetriever(BaseModel):
         shard = edge.EdgeShard.load(f"cache/edge/layer{layer_idx:02d}_head{head_idx}")
         self._shards[key] = shard
         return shard
-
-    @cached_property
-    def _pool(self) -> ThreadPoolExecutor:
-        return ThreadPoolExecutor(max_workers=4)
 
     def _query_head(
         self, layer_idx: int, head_idx: int, query_states: npt.NDArray
@@ -253,7 +317,7 @@ class QdrantEdgeRetriever(BaseModel):
 
 
 RetrieverConfig = Annotated[
-    TopKRetriever | FullContextRetriever | QdrantRetriever | QdrantEdgeRetriever,
+    TopKRetriever | FullContextRetriever | QdrantRetriever | QdrantEdgeRetriever | QdrantEdgeNativeRetriever,
     Field(discriminator="type"),
 ]
 

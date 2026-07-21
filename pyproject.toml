@@ -27,8 +27,8 @@ dependencies = [
 kv-search = "kv_search.main:main"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.14,<2"]
+build-backend = "maturin"
 
 [tool.uv]
 no-build-isolation-package = ["flash-attn", "causal-conv1d"]
@@ -36,7 +36,11 @@ extra-build-dependencies = { flash-attn = ["ninja"], causal-conv1d = ["ninja"] }
 # This is somewhat nvidia spark specific but whatever
 extra-build-variables = { flash-attn = { MAX_JOBS = "16", FLASH_ATTN_CUDA_ARCHS = "120" }, causal-conv1d = { MAX_JOBS = "16" } }
 
+[tool.maturin]
+module-name = "kv_search._native"
+
 [dependency-groups]
 dev = [
+    "maturin>=1.14.1",
     "ninja>=1.13.0",
 ]
