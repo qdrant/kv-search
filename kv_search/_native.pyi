@@ -5,10 +5,9 @@ class NativeEdgeRetriever:
     def retrieve(
         self,
         layer_idx: int,
-        head_idx: int,
-        q: np.ndarray[tuple[int], np.dtype[np.float32]],
+        q: np.ndarray[tuple[int, int, int], np.dtype[np.float32]],
         limit: int,
     ) -> tuple[
-        np.ndarray[tuple[int, int], np.dtype[np.float32]],
-        np.ndarray[tuple[int, int], np.dtype[np.float32]],
+        np.ndarray[tuple[int, int, int], np.dtype[np.float32]],
+        np.ndarray[tuple[int, int, int], np.dtype[np.float32]],
     ]: ...

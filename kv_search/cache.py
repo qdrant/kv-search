@@ -199,50 +199,23 @@ class QdrantEdgeNativeRetriever(BaseModel):
             ]
         )
 
-    def _query_head(
-        self, layer_idx: int, head_idx: int, query_states: npt.NDArray
-    ) -> tuple[npt.NDArray, npt.NDArray]:
-        query_idx = head_idx * 4
-        data = [
-            self._engine.retrieve(
-                layer_idx,
-                head_idx,
-                query_states[query_idx + i, token_idx],
-                limit=self.n_retrieved,
-            )
-            for token_idx in range(query_states.shape[1])
-            for i in range(4)
-        ]
-        keys = np.concat(
-            [k for k, _ in data],
-            axis=0,
-            dtype=np.float32,
-        )
-        values = np.concat(
-            [v for _, v in data],
-            axis=0,
-            dtype=np.float32,
-        )
-        return keys, values
-
     def retrieve(
         self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
     ) -> tuple[torch.Tensor, torch.Tensor]:
         query = query_states[0].to(torch.float32).cpu().numpy()
         with timers.qdrant_retrieve:
-            # results = list(
-            #     self._pool.map(
-            #         lambda h: self._query_head(layer_idx, h, query), range(4)
-            #     )
-            # )
-            results = [self._query_head(layer_idx, h, query) for h in range(4)]
+            keys, values = self._engine.retrieve(
+                layer_idx,
+                query,
+                limit=self.n_retrieved,
+            )
         keys = (
-            torch.from_numpy(np.stack([k for k, _ in results]))
+            torch.from_numpy(keys)
             .unsqueeze(0)
             .to(query_states.device, query_states.dtype)
         )
         values = (
-            torch.from_numpy(np.stack([v for _, v in results]))
+            torch.from_numpy(values)
             .unsqueeze(0)
             .to(query_states.device, query_states.dtype)
         )
@@ -317,7 +290,11 @@ class QdrantEdgeRetriever(BaseModel):
 
 
 RetrieverConfig = Annotated[
-    TopKRetriever | FullContextRetriever | QdrantRetriever | QdrantEdgeRetriever | QdrantEdgeNativeRetriever,
+    TopKRetriever
+    | FullContextRetriever
+    | QdrantRetriever
+    | QdrantEdgeRetriever
+    | QdrantEdgeNativeRetriever,
     Field(discriminator="type"),
 ]
 
