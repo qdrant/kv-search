@@ -356,12 +356,12 @@ class RetrievalCache(DynamicCache):
             key_states, value_states, layer_idx, *args, **kwargs
         )
 
-        if query_states is not None:
-            cached_keys, cached_values = self.retriever.retrieve(
-                query_states, layer_idx, self.prefill
-            )
-            keys = torch.cat([cached_keys, keys], dim=2)
-            values = torch.cat([cached_values, values], dim=2)
+        # if query_states is not None:
+        #     cached_keys, cached_values = self.retriever.retrieve(
+        #         query_states, layer_idx, self.prefill
+        #     )
+        #     keys = torch.cat([cached_keys, keys], dim=2)
+        #     values = torch.cat([cached_values, values], dim=2)
 
         return keys, values
 
@@ -530,15 +530,8 @@ def load_cache(
     return cache, meta["context_len"]
 
 
-def _make_attention_mask(
-    attn_impl: str, q_len: int, k_len: int, dtype, device
-) -> torch.Tensor | None:
-    # Need to dynamically create our attention mask because transformers does not have sane defaults for causal/attention masks during inference
-    # usually this is created beforehand, when the prompt is tokenized, but we don't know the context length then
+def _causal_mask(q_len: int, k_len: int, dtype, device) -> torch.Tensor | None:
     if q_len <= 1:
-        return None
-
-    if attn_impl not in ("sdpa", "eager"):
         return None
 
     attention_mask = torch.zeros(q_len, k_len, dtype=dtype, device=device)
@@ -551,6 +544,65 @@ def _make_attention_mask(
         diagonal=1,
     )
     return attention_mask[None, None]
+
+
+def _make_attention_mask(
+    attn_impl: str, q_len: int, k_len: int, dtype, device
+) -> torch.Tensor | None:
+    # Need to dynamically create our attention mask because transformers does not have sane defaults for causal/attention masks during inference
+    # usually this is created beforehand, when the prompt is tokenized, but we don't know the context length then
+    if attn_impl not in ("sdpa", "eager"):
+        return None
+
+    return _causal_mask(q_len, k_len, dtype, device)
+
+
+# HACK: Most of this is somewhat specific to qwen3.5 and also implemented in the slowest possible way
+# generalizing and improving is tbd
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def _partition_attend(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    scaling: float,
+    mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key_states = _repeat_kv(key, 4).to(torch.float32)
+    value_states = _repeat_kv(value, 4).to(torch.float32)
+
+    attn_weights = torch.matmul(query.to(torch.float32), key_states.transpose(2, 3)) * scaling
+
+    if mask is not None:
+        attn_weights = attn_weights + mask
+
+    lse = torch.logsumexp(attn_weights, dim=-1)
+    out = torch.matmul(
+        torch.softmax(attn_weights, dim=-1), value_states
+    )
+
+    return out, lse
+
+
+def _merge_partitions(
+    out_a: torch.Tensor, lse_a: torch.Tensor, out_b: torch.Tensor, lse_b: torch.Tensor
+) -> torch.Tensor:
+    lse = torch.logaddexp(lse_a, lse_b)
+    wa = torch.exp(lse_a - lse).unsqueeze(-1)
+    wb = torch.exp(lse_b - lse).unsqueeze(-1)
+    return wa * out_a + wb * out_b
 
 
 def _qwen_3_5_forward(
@@ -590,28 +642,53 @@ def _qwen_3_5_forward(
             key_states, value_states, self.layer_idx, query_states=query_states
         )
 
-    attention_mask = _make_attention_mask(
-        self.config._attn_implementation,
-        query_states.shape[2],
-        key_states.shape[2],
-        query_states.dtype,
-        query_states.device,
-    )
+    if isinstance(past_key_values, RetrievalCache):
+        # NOTE: at least part of this should be happening in the retriever
+        k_retrieved, v_retrieved = past_key_values.retriever.retrieve(
+            query_states, self.layer_idx, prefill=past_key_values.prefill
+        )
 
-    attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation, eager_attention_forward
-    )
+        retrieved_out, retrieved_lse = _partition_attend(
+            query_states, k_retrieved, v_retrieved, self.scaling, None
+        )
 
-    attn_output, attn_weights = attention_interface(
-        self,
-        query_states,
-        key_states,
-        value_states,
-        attention_mask,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
-        **kwargs,
-    )
+        live_mask = _causal_mask(
+            query_states.shape[2],
+            key_states.shape[2],
+            query_states.dtype,
+            query_states.device,
+        )
+        live_out, live_lse = _partition_attend(
+            query_states, key_states, value_states, self.scaling, live_mask
+        )
+
+        attn_output = _merge_partitions(
+            live_out, live_lse, retrieved_out, retrieved_lse
+        )
+        attn_output = attn_output.to(query_states.dtype).transpose(1, 2).contiguous()
+    else:
+        attention_mask = _make_attention_mask(
+            self.config._attn_implementation,
+            query_states.shape[2],
+            key_states.shape[2],
+            query_states.dtype,
+            query_states.device,
+        )
+
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)
