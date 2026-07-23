@@ -10,6 +10,8 @@ import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import Batch, Distance, HnswConfigDiff, VectorParams
 from qdrant_client.qdrant_remote import QdrantRemote
+from rich.live import Live
+from rich.markdown import Markdown
 from transformers.cache_utils import CacheLayerMixin
 
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
@@ -24,6 +26,8 @@ import torch
 import transformers.utils.logging
 from pydantic import BaseModel, Field
 from pydantic_settings import CliApp, CliSubCommand
+from rich.console import Console
+from rich.panel import Panel
 from rich.progress import track
 
 # auto_docstring emits [ERROR] lines via print() at class-definition time
@@ -48,17 +52,17 @@ with contextlib.redirect_stdout(io.StringIO()):
     )
 
 from kv_search.cache import (
+    FullContextRetriever,
+    QdrantEdgeNativeRetriever,
+    QdrantEdgeRetriever,
     QdrantRetriever,
     RecordingCache,
     RetrievalCache,
     RetrieverConfig,
+    TopKRetriever,
     bind_query_aware_cache,
     load_cache,
     save_cache,
-    TopKRetriever,
-    FullContextRetriever,
-    QdrantEdgeRetriever,
-    QdrantEdgeNativeRetriever,
 )
 from kv_search.data import Datasets, Message, load_dataset
 from kv_search.timer import timers
@@ -72,6 +76,8 @@ IS_MULTIMODAL = {
     "google/gemma-4-12B-it",
 }
 
+
+console = Console()
 
 ModelType = (
     Qwen3_5ForConditionalGeneration
@@ -272,6 +278,8 @@ class TimedStreamer(TextStreamer):
         **decode_kwargs: Any,
     ):
         super().__init__(tokenizer, skip_prompt, **decode_kwargs)
+        self._buffer = ""
+        self._live: Live | None = None
 
     def put(self, value):
         if self.next_tokens_are_prompt:
@@ -280,9 +288,22 @@ class TimedStreamer(TextStreamer):
         timers.token_gen.record()
         super().put(value)
 
+    def on_finalized_text(self, text, stream_end=False):
+        if self._live is None:
+            self._buffer = ""
+            self._live = Live(
+                console=console, auto_refresh=False, vertical_overflow="visible"
+            )
+            self._live.start()
+        self._buffer += text
+        self._live.update(Markdown(self._buffer), refresh=True)
+
     def end(self):
         timers.token_gen.reset_lap()
         super().end()
+        if self._live is not None:
+            self._live.update(Markdown(self._buffer), refresh=True)
+            self._live.stop()
 
 
 class CacheImpl(Enum):
@@ -373,16 +394,23 @@ class CmdChat(BaseModel):
 
         while True:
             try:
-                user = input("\n> ").strip()
+                if streamer._live is not None:
+                    streamer._live.stop()
+                    streamer._live = None
+
+                print()
+                console.rule(f"user \\[retriever = {cache.retriever.type}]", style="bright_cyan")
+                user = console.input("[bold bright_cyan]> [/]").strip()
+                if not sys.stdin.isatty():
+                    console.print(user)
+                console.rule(style="bright_cyan")
+                print()
             except EOFError, KeyboardInterrupt:
                 print()
                 return
 
             if not user:
                 continue
-
-            if not sys.stdin.isatty():
-                print(user)
 
             if user.startswith("/"):
                 cmd = user[1:].strip()
@@ -405,7 +433,6 @@ class CmdChat(BaseModel):
                 continue
 
             try:
-                print()
                 self._generate(model, processor, cache, context_len, streamer, user)
             except KeyboardInterrupt:
                 streamer.end()
