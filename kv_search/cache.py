@@ -583,15 +583,15 @@ def _partition_attend(
     key_states = _repeat_kv(key, 4).to(torch.float32)
     value_states = _repeat_kv(value, 4).to(torch.float32)
 
-    attn_weights = torch.matmul(query.to(torch.float32), key_states.transpose(2, 3)) * scaling
+    attn_weights = (
+        torch.matmul(query.to(torch.float32), key_states.transpose(2, 3)) * scaling
+    )
 
     if mask is not None:
         attn_weights = attn_weights + mask
 
     lse = torch.logsumexp(attn_weights, dim=-1)
-    out = torch.matmul(
-        torch.softmax(attn_weights, dim=-1), value_states
-    )
+    out = torch.matmul(torch.softmax(attn_weights, dim=-1), value_states)
 
     return out, lse
 
@@ -642,7 +642,10 @@ def _qwen_3_5_forward(
             key_states, value_states, self.layer_idx, query_states=query_states
         )
 
-    if isinstance(past_key_values, RetrievalCache):
+    is_full_context = isinstance(past_key_values, RetrievalCache) and isinstance(
+        past_key_values.retriever, FullContextRetriever
+    )
+    if isinstance(past_key_values, RetrievalCache) and not is_full_context:
         # NOTE: at least part of this should be happening in the retriever
         k_retrieved, v_retrieved = past_key_values.retriever.retrieve(
             query_states, self.layer_idx, prefill=past_key_values.prefill
@@ -668,6 +671,13 @@ def _qwen_3_5_forward(
         attn_output = attn_output.to(query_states.dtype).transpose(1, 2).contiguous()
         attn_weights = None
     else:
+        if is_full_context:
+            k_retrieved, v_retrieved = past_key_values.retriever.retrieve(
+                query_states, self.layer_idx, prefill=past_key_values.prefill
+            )
+            key_states = torch.cat([k_retrieved, key_states], dim=2)
+            value_states = torch.cat([v_retrieved, value_states], dim=2)
+
         attention_mask = _make_attention_mask(
             self.config._attn_implementation,
             query_states.shape[2],
