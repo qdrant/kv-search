@@ -2,6 +2,7 @@ import contextlib
 import io
 import os
 import shutil
+import sys
 import tempfile
 
 import qdrant_edge as edge
@@ -54,6 +55,10 @@ from kv_search.cache import (
     bind_query_aware_cache,
     load_cache,
     save_cache,
+    TopKRetriever,
+    FullContextRetriever,
+    QdrantEdgeRetriever,
+    QdrantEdgeNativeRetriever,
 )
 from kv_search.data import Datasets, Message, load_dataset
 from kv_search.timer import timers
@@ -320,6 +325,15 @@ class CmdPrefill(BaseModel):
         _print_stats()
 
 
+_RETRIEVERS: dict[str, type[RetrieverConfig]] = {
+    "topk": TopKRetriever,
+    "full": FullContextRetriever,
+    "qdrant": QdrantRetriever,
+    "edge": QdrantEdgeRetriever,
+    "native": QdrantEdgeNativeRetriever,
+}
+
+
 class CmdChat(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
@@ -353,6 +367,10 @@ class CmdChat(BaseModel):
         context_len: int,
         streamer: TimedStreamer,
     ) -> None:
+
+        instances = {cache.retriever.type: cache.retriever}
+        n_retrieved = getattr(cache.retriever, "n_retrieved", 128)
+
         while True:
             try:
                 user = input("\n> ").strip()
@@ -361,6 +379,29 @@ class CmdChat(BaseModel):
                 return
 
             if not user:
+                continue
+
+            if not sys.stdin.isatty():
+                print(user)
+
+            if user.startswith("/"):
+                cmd = user[1:].strip()
+                if cmd in ("help", "?"):
+                    print(
+                        "commands: "
+                        + ", ".join(f"/{t}" for t in _RETRIEVERS)
+                        + ", /help"
+                    )
+                elif cmd in _RETRIEVERS:
+                    if cmd not in instances:
+                        r = _RETRIEVERS[cmd]()
+                        if hasattr(r, "n_retrieved"):
+                            r.n_retrieved = n_retrieved
+                        instances[cmd] = r
+                    cache.retriever = instances[cmd]
+                    print(f"[retriever = {cmd}]")
+                else:
+                    print(f"unknown command '/{cmd}', see /help")
                 continue
 
             try:
