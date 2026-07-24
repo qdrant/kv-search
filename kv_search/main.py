@@ -27,7 +27,6 @@ import transformers.utils.logging
 from pydantic import BaseModel, Field
 from pydantic_settings import CliApp, CliSubCommand
 from rich.console import Console
-from rich.panel import Panel
 from rich.progress import track
 
 # auto_docstring emits [ERROR] lines via print() at class-definition time
@@ -280,6 +279,7 @@ class TimedStreamer(TextStreamer):
         super().__init__(tokenizer, skip_prompt, **decode_kwargs)
         self._buffer = ""
         self._live: Live | None = None
+        self._render_live = True
 
     def put(self, value):
         if self.next_tokens_are_prompt:
@@ -289,6 +289,10 @@ class TimedStreamer(TextStreamer):
         super().put(value)
 
     def on_finalized_text(self, text, stream_end=False):
+        if not self._render_live:
+            super().on_finalized_text(text, stream_end)
+            return
+
         if self._live is None:
             self._buffer = ""
             self._live = Live(
@@ -304,6 +308,12 @@ class TimedStreamer(TextStreamer):
         if self._live is not None:
             self._live.update(Markdown(self._buffer), refresh=True)
             self._live.stop()
+
+    def reset(self, render_live: bool = True):
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+        self._render_live = render_live
 
 
 class CacheImpl(Enum):
@@ -360,6 +370,7 @@ class CmdChat(BaseModel):
     dataset_name: Datasets = Datasets.QDRANT
     retriever: RetrieverConfig = Field(default_factory=QdrantRetriever)
     max_new_tokens: int = 256
+    render_live: bool = True
 
     def cli_cmd(self) -> None:
         model, processor = _load_model(self.model_name)
@@ -394,12 +405,12 @@ class CmdChat(BaseModel):
 
         while True:
             try:
-                if streamer._live is not None:
-                    streamer._live.stop()
-                    streamer._live = None
+                streamer.reset(render_live=self.render_live)
 
                 print()
-                console.rule(f"user \\[retriever = {cache.retriever.type}]", style="bright_cyan")
+                console.rule(
+                    f"user \\[retriever = {cache.retriever.type}]", style="bright_cyan"
+                )
                 user = console.input("[bold bright_cyan]> [/]").strip()
                 if not sys.stdin.isatty():
                     console.print(user)
@@ -420,6 +431,9 @@ class CmdChat(BaseModel):
                         + ", ".join(f"/{t}" for t in _RETRIEVERS)
                         + ", /help"
                     )
+                elif cmd == "live":
+                    self.render_live = not self.render_live
+                    print(f"[render_live = {self.render_live}]")
                 elif cmd in _RETRIEVERS:
                     if cmd not in instances:
                         r = _RETRIEVERS[cmd]()
