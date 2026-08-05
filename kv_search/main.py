@@ -515,7 +515,8 @@ class CmdAnalyze(BaseModel):
         cache_dir.mkdir(exist_ok=True, parents=True)
 
         data = CachedData(cache_dir, model_name=self.model_name)
-        data.plot_mse()
+        # data.plot_mse()
+        data.plot_indices()
 
 
 class CmdKvSearch(

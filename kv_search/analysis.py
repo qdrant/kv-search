@@ -9,6 +9,7 @@ from rich.progress import track
 from safetensors.torch import safe_open
 from transformers import AutoConfig, PreTrainedConfig
 from transformers.cache_utils import CacheLayerMixin, LinearAttentionCacheLayerMixin
+import numpy as np
 
 from kv_search.cache import _repeat_kv, load_cache
 
@@ -49,11 +50,15 @@ class CachedData:
             q = f.get_slice("queries")[:, positions, :, :]
         return q.transpose(1, 2).contiguous()
 
+    def indices(self, layer_idx: int) -> torch.Tensor:
+        path = self.cache_dir / f"indices_{layer_idx:02d}.safetensors"
+        with safe_open(path, framework="pt", device=self.device) as f:
+            return f.get_slice("indices")[:]
 
-    def plot_mse(self: CachedData):
+    def plot_mse(self):
         layers = list(self.full_layers)
         fig = plt.figure(figsize=(12, 4 * len(layers)), layout="constrained")
-        st = fig.suptitle(self.config.model_type, fontsize=24)
+        fig.suptitle(self.config.model_type, fontsize=24)
 
         axs: list[Axes] = fig.subplots(nrows=len(layers))
 
@@ -104,3 +109,37 @@ class CachedData:
                 ax.set_title(f"Layer {layer_idx}")
                 ax.legend()
         fig.savefig(self.cache_dir / "mse.png")
+
+    def plot_indices(self) -> None:
+        layers = list(self.full_layers)
+        fig = plt.figure(figsize=(12, 2.5 * len(layers)), layout="constrained")
+        fig.suptitle(self.config.model_type, fontsize=24)
+
+        axs: list[Axes] = fig.subplots(nrows=len(layers))
+
+        n_bins = 512
+
+        for ax, (layer_idx, layer) in zip(axs, layers):
+            indices = self.indices(layer_idx).cpu().numpy()  # [16, q_len, n]
+
+            heat = np.zeros((indices.shape[1], n_bins))  # [q_len, c_len (binned)]
+
+            bins = indices * n_bins // self.context_len
+
+            for head_idx in range(indices.shape[0]):
+                present = np.zeros(
+                    (indices.shape[1], n_bins), dtype=bool
+                )  # [q_len, c_len (binned)]
+                np.put_along_axis(present, bins[head_idx], True, axis=1)
+                heat += present
+
+            ax.imshow(
+                heat,
+                cmap="magma",
+                aspect="auto",
+                vmin=0,
+                vmax=indices.shape[0],
+                interpolation="nearest",
+            )
+
+        fig.savefig(self.cache_dir / "index_heatmap.png")
