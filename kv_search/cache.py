@@ -2,10 +2,12 @@ import compression.zstd
 import json
 import math
 import types
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Annotated, BinaryIO, Callable, Literal, Protocol, Unpack
+from typing import Annotated, BinaryIO, Literal, Protocol, Unpack
 
 import numpy as np
 import numpy.typing as npt
@@ -32,14 +34,24 @@ from transformers.models.ministral3.modeling_ministral3 import Ministral3Attenti
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
-from kv_search.timer import timers
 from kv_search._native import NativeEdgeRetriever
+from kv_search.timer import timers
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionPartition:
+    out: torch.Tensor
+    lse: torch.Tensor
 
 
 class Retriever(Protocol):
     def retrieve(
-        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        query_states: torch.Tensor,
+        layer_idx: int,
+        prefill: DynamicCache,
+        scaling: float,
+    ) -> AttentionPartition:
         """Return topk (keys, values) from prefill context for given queries."""
 
 
@@ -47,8 +59,15 @@ class FullContextRetriever(BaseModel):
     type: Literal["full"] = "full"
 
     def retrieve(
-        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
-    ):
+        self,
+        query_states: torch.Tensor,
+        layer_idx: int,
+        prefill: DynamicCache,
+        scaling: float,
+    ) -> AttentionPartition:
+        raise NotImplementedError
+
+    def prefill_kv(self, layer_idx: int, prefill: DynamicCache):
         layer = prefill.layers[layer_idx]
         assert isinstance(layer, CacheLayerMixin)
         assert layer.keys is not None
@@ -60,60 +79,38 @@ class TopKRetriever(BaseModel):
     type: Literal["topk"] = "topk"
     n_retrieved: int = 128
 
-    def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-        """
-        This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-        num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-        """
-        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
-        if n_rep == 1:
-            return hidden_states
-        hidden_states = hidden_states[:, :, None, :, :].expand(
-            batch, num_key_value_heads, n_rep, slen, head_dim
-        )
-        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
-
-    def _eager_attention_forward(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        scaling: float,
-        attention_mask: torch.Tensor | None = None,
-        softcap: float | None = None,
-    ) -> torch.Tensor:
-        key_states = self._repeat_kv(key, 4)
-
-        attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-
-        if softcap is not None:
-            attn_weights = attn_weights / softcap
-            attn_weights = torch.tanh(attn_weights)
-            attn_weights = attn_weights * softcap
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        # attn_weights = torch.nn.functional.softmax(
-        #     attn_weights, dim=-1, dtype=torch.float32
-        # ).to(query.dtype)
-
-        return attn_weights
-
     def retrieve(
-        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
-    ):
+        self,
+        query_states: torch.Tensor,
+        layer_idx: int,
+        prefill: DynamicCache,
+        scaling: float,
+    ) -> AttentionPartition:
         layer = prefill.layers[layer_idx]
         assert isinstance(layer, CacheLayerMixin)
-        assert layer.keys is not None
-        assert layer.values is not None
+        assert layer.keys is not None and layer.values is not None
 
-        s = self._eager_attention_forward(query_states, layer.keys, scaling=1)
-        _, idx = torch.topk(s, self.n_retrieved, dim=-1)
-        idx = idx.reshape((1, 4, -1, 1))
+        query = query_states.to(torch.float32)  # [1, 16, q_len, d]
+        keys = _repeat_kv(layer.keys, 4).to(torch.float32)  # [1, 16, k_len, d]
+        values = _repeat_kv(layer.values, 4).to(torch.float32)  # [1, 16, k_len, d]
 
-        keys = layer.keys.take_along_dim(idx, dim=2)
-        values = layer.values.take_along_dim(idx, dim=2)
+        logits = (
+            torch.matmul(query, keys.transpose(2, 3)) * scaling
+        )  # [1, 16, q_len, k_len]
+        weights, idx = torch.topk(logits, self.n_retrieved, dim=-1)  # [1, 16, q_len, n]
 
-        return keys, values
+        values = values.unsqueeze(2).expand(
+            -1, -1, idx.shape[2], -1, -1
+        )  # [1, 16, q_len, k_len, d]
+        idx = idx.unsqueeze(-1).expand(
+            -1, -1, -1, -1, values.shape[-1]
+        )  # [1, 16, q_len, n, d]
+        values = values.take_along_dim(idx, dim=3)  # [1, 16, q_len, n, d]
+
+        lse = torch.logsumexp(weights, dim=-1)
+        out = torch.einsum("bhqn,bhqnd->bhqd", torch.softmax(weights, dim=-1), values)
+
+        return AttentionPartition(out=out, lse=lse)
 
 
 class QdrantRetriever(BaseModel):
@@ -271,7 +268,6 @@ class QdrantEdgeRetriever(BaseModel):
         query = query_states[0].to(torch.float32).cpu().numpy()
         with timers.qdrant_retrieve:
             # results = list(
-            #     self._pool.map(
             #         lambda h: self._query_head(layer_idx, h, query), range(4)
             #     )
             # )
@@ -579,7 +575,7 @@ def _partition_attend(
     value: torch.Tensor,
     scaling: float,
     mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> AttentionPartition:
     key_states = _repeat_kv(key, 4).to(torch.float32)
     value_states = _repeat_kv(value, 4).to(torch.float32)
 
@@ -593,7 +589,7 @@ def _partition_attend(
     lse = torch.logsumexp(attn_weights, dim=-1)
     out = torch.matmul(torch.softmax(attn_weights, dim=-1), value_states)
 
-    return out, lse
+    return AttentionPartition(out=out, lse=lse)
 
 
 def _merge_partitions(
@@ -647,12 +643,11 @@ def _qwen_3_5_forward(
     )
     if isinstance(past_key_values, RetrievalCache) and not is_full_context:
         # NOTE: at least part of this should be happening in the retriever
-        k_retrieved, v_retrieved = past_key_values.retriever.retrieve(
-            query_states, self.layer_idx, prefill=past_key_values.prefill
-        )
-
-        retrieved_out, retrieved_lse = _partition_attend(
-            query_states, k_retrieved, v_retrieved, self.scaling, None
+        retrieved = past_key_values.retriever.retrieve(
+            query_states,
+            self.layer_idx,
+            prefill=past_key_values.prefill,
+            scaling=self.scaling,
         )
 
         live_mask = _causal_mask(
@@ -661,19 +656,19 @@ def _qwen_3_5_forward(
             query_states.dtype,
             query_states.device,
         )
-        live_out, live_lse = _partition_attend(
+        live = _partition_attend(
             query_states, key_states, value_states, self.scaling, live_mask
         )
 
         attn_output = _merge_partitions(
-            live_out, live_lse, retrieved_out, retrieved_lse
+            live.out, live.lse, retrieved.out, retrieved.lse
         )
         attn_output = attn_output.to(query_states.dtype).transpose(1, 2).contiguous()
         attn_weights = None
     else:
         if is_full_context:
-            k_retrieved, v_retrieved = past_key_values.retriever.retrieve(
-                query_states, self.layer_idx, prefill=past_key_values.prefill
+            k_retrieved, v_retrieved = past_key_values.retriever.prefill_kv(
+                self.layer_idx, prefill=past_key_values.prefill
             )
             key_states = torch.cat([k_retrieved, key_states], dim=2)
             value_states = torch.cat([v_retrieved, value_states], dim=2)
