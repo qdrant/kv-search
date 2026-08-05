@@ -1,3 +1,5 @@
+import rich
+from rich.table import Table
 import math
 from collections.abc import Generator
 from pathlib import Path
@@ -143,3 +145,42 @@ class CachedData:
             )
 
         fig.savefig(self.cache_dir / "index_heatmap.png")
+
+    def index_stats(self) -> None:
+        layers = list(self.full_layers)
+        table = Table("Layer", "# touched", "Hit Ceiling", "Retention", "Redundancy")
+        for layer_idx, layer in layers:
+            indices: np.ndarray = (
+                self.indices(layer_idx).cpu().numpy()
+            )  # [16, q_len, n]
+            num_touched_per_head = np.mean(
+                [np.unique(indices[h]).size for h in range(indices.shape[0])],
+                dtype=float,
+            )
+            hit_ceiling = 1 - num_touched_per_head / indices.shape[1] / indices.shape[2]
+            retention = np.mean(
+                [
+                    len(set(indices[h, t]) & set(indices[h, t - 1]))
+                    for h in range(indices.shape[0])
+                    for t in range(1, indices.shape[1])
+                ],
+                dtype=float,
+            )
+            redundancy = np.mean(
+                [
+                    indices.shape[0]
+                    * indices.shape[2]
+                    / np.unique(indices[:, t, :]).size
+                    for t in range(indices.shape[1])
+                ]
+            )
+
+            table.add_row(
+                str(layer_idx),
+                f"{num_touched_per_head:.2f}",
+                f"{hit_ceiling:.2f}",
+                f"{retention:.2f}",
+                f"{redundancy:.2f}",
+            )
+
+        rich.print(table)
