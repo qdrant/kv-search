@@ -107,8 +107,10 @@ class TopKRetriever(BaseModel):
         )  # [1, 16, q_len, n, d]
         values = values.take_along_dim(idx, dim=3)  # [1, 16, q_len, n, d]
 
-        lse = torch.logsumexp(weights, dim=-1)
-        out = torch.einsum("bhqn,bhqnd->bhqd", torch.softmax(weights, dim=-1), values)
+        lse = torch.logsumexp(weights, dim=-1)  # [1, 16, q_len]
+        out = torch.einsum(
+            "bhqn,bhqnd->bhqd", torch.softmax(weights, dim=-1), values
+        )  # [1, 16, q_len, d]
 
         return AttentionPartition(out=out, lse=lse)
 
@@ -197,26 +199,31 @@ class QdrantEdgeNativeRetriever(BaseModel):
         )
 
     def retrieve(
-        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        query_states: torch.Tensor,
+        layer_idx: int,
+        prefill: DynamicCache,
+        scaling: float,
+    ) -> AttentionPartition:
         query = query_states[0].to(torch.float32).cpu().numpy()
         with timers.qdrant_retrieve:
-            keys, values = self._engine.retrieve(
+            out, lse = self._engine.retrieve(
                 layer_idx,
                 query,
                 limit=self.n_retrieved,
+                scaling=scaling,
             )
-        keys = (
-            torch.from_numpy(keys)
+        out = (
+            torch.from_numpy(out)
             .unsqueeze(0)
             .to(query_states.device, query_states.dtype)
         )
-        values = (
-            torch.from_numpy(values)
+        lse = (
+            torch.from_numpy(lse)
             .unsqueeze(0)
             .to(query_states.device, query_states.dtype)
         )
-        return keys, values
+        return AttentionPartition(out=out, lse=lse)
 
 
 class QdrantEdgeRetriever(BaseModel):

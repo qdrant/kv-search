@@ -4,7 +4,7 @@ use pyo3::prelude::*;
 mod _native {
     use std::{collections::HashMap, path::Path};
 
-    use numpy::{PyArray3, PyReadonlyArray3, ndarray::s};
+    use numpy::{PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray3, ndarray::s};
     use pyo3::exceptions::PyRuntimeError;
     use pyo3::prelude::*;
     use qdrant_edge::{
@@ -40,7 +40,8 @@ mod _native {
             layer_idx: usize,
             q: PyReadonlyArray3<'_, f32>, // [16, q_len, 256]
             limit: usize,
-        ) -> PyResult<(Bound<'py, PyArray3<f32>>, Bound<'py, PyArray3<f32>>)> {
+            scaling: f32,
+        ) -> PyResult<(Bound<'py, PyArray3<f32>>, Bound<'py, PyArray2<f32>>)> {
             let arr = q.as_array();
             let q_heads = arr.shape()[0];
             let q_len = arr.shape()[1];
@@ -49,7 +50,8 @@ mod _native {
                 .flat_map(|qh| (0..q_len).map(move |t| (qh / 4, arr.slice(s![qh, t, ..]).to_vec())))
                 .collect();
 
-            let per_query: Vec<(usize, Vec<Vec<f32>>, Vec<Vec<f32>>)> = queries
+            // per query head and query token
+            let results: Vec<(Vec<f32>, f32)> = queries
                 .into_par_iter()
                 .map(|(h, qv)| {
                     let points = self.shards[&(layer_idx, h)]
@@ -64,44 +66,66 @@ mod _native {
                             limit: limit,
                             offset: 0,
                             params: None,
-                            with_vector: WithVector::Bool(true),
+                            with_vector: WithVector::Selector(vec!["value".to_string()]),
                             with_payload: WithPayloadInterface::Bool(false),
                         })
                         .map_err(|e| e.to_string())?;
 
-                    let mut keys: Vec<Vec<f32>> = Vec::with_capacity(points.len());
-                    let mut values: Vec<Vec<f32>> = Vec::with_capacity(points.len());
+                    if points.is_empty() {
+                        return Ok((Vec::new(), f32::NEG_INFINITY));
+                    }
+
+                    // logit_i = score_i * scaling
+                    // m = max(logit_i for all i)
+                    // w_i = exp(logit_i - m)
+                    // lse = m + ln(sum(w_i))
+                    // out = sum(w_i * v_i) / sum(w_i)
+                    let m = points
+                        .iter()
+                        .map(|p| p.score * scaling)
+                        .fold(f32::NEG_INFINITY, f32::max);
+
+                    let mut out: Vec<f32> = Vec::new();
+                    let mut sum = 0.0f32;
                     for p in points {
                         let Some(VectorStructInternal::Named(mut named)) = p.vector else {
                             return Err("scored point has no named vectors".to_string());
                         };
 
-                        match (named.remove("key"), named.remove("value")) {
-                            (Some(VectorInternal::Dense(k)), Some(VectorInternal::Dense(v))) => {
-                                keys.push(k);
-                                values.push(v);
-                            }
-                            _ => return Err("blah".to_string()),
+                        let Some(VectorInternal::Dense(v)) = named.remove("value") else {
+                            return Err("no vector named 'value'".to_string());
+                        };
+                        if out.is_empty() {
+                            out = vec![0.0; v.len()];
+                        }
+                        let w = (p.score * scaling - m).exp();
+                        sum += w;
+                        for (o, x) in out.iter_mut().zip(v.iter()) {
+                            *o += w * x;
                         }
                     }
-                    Ok((h, keys, values))
+                    let inv = 1.0 / sum;
+                    for o in out.iter_mut() {
+                        *o *= inv;
+                    }
+                    Ok((out, m + sum.ln()))
                 })
                 .collect::<Result<Vec<_>, String>>()
                 .map_err(|e| PyRuntimeError::new_err(e))?;
 
-            let n_kv = q_heads / 4;
-            let mut keys: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_kv];
-            let mut values: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_kv];
+            let value_dim = results.iter().map(|(o, _)| o.len()).max().unwrap_or(0);
+            let mut out_flat: Vec<f32> = Vec::with_capacity(q_heads * q_len * value_dim);
+            let mut lse_flat: Vec<f32> = Vec::with_capacity(q_heads * q_len);
 
-            for (kv, k, v) in per_query {
-                keys[kv].extend(k);
-                values[kv].extend(v);
+            for (out, lse) in results {
+                out_flat.extend_from_slice(&out);
+                lse_flat.push(lse);
             }
 
-            let keys = PyArray3::from_vec3(py, &keys)?;
-            let values = PyArray3::from_vec3(py, &values)?;
+            let out = PyArray1::from_vec(py, out_flat).reshape([q_heads, q_len, value_dim])?;
+            let lse = PyArray1::from_vec(py, lse_flat).reshape([q_heads, q_len])?;
 
-            Ok((keys, values))
+            Ok((out, lse))
         }
     }
 }

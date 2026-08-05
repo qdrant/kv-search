@@ -7,7 +7,8 @@ class NativeEdgeRetriever:
         layer_idx: int,
         q: np.ndarray[tuple[int, int, int], np.dtype[np.float32]],
         limit: int,
+        scaling: float,
     ) -> tuple[
         np.ndarray[tuple[int, int, int], np.dtype[np.float32]],
-        np.ndarray[tuple[int, int, int], np.dtype[np.float32]],
+        np.ndarray[tuple[int, int], np.dtype[np.float32]],
     ]: ...
