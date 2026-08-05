@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, PrivateAttr
 from qdrant_client import QdrantClient
 from qdrant_client.models import QueryRequest, SearchParams
 from rich.progress import track
-from safetensors.torch import load, save
+from safetensors.torch import load, save, save_file
 from transformers import PreTrainedConfig, PretrainedConfig
 from transformers.cache_utils import (
     Cache,
@@ -65,6 +65,7 @@ class FullContextRetriever(BaseModel):
         prefill: DynamicCache,
         scaling: float,
     ) -> AttentionPartition:
+        # TODO: we can use this again once we can use a fast kernel here
         raise NotImplementedError
 
     def prefill_kv(self, layer_idx: int, prefill: DynamicCache):
@@ -78,6 +79,8 @@ class FullContextRetriever(BaseModel):
 class TopKRetriever(BaseModel):
     type: Literal["topk"] = "topk"
     n_retrieved: int = 128
+    record_indices: bool = False
+    _indices: dict[int, list[torch.Tensor]] = PrivateAttr(default_factory=dict)
 
     def retrieve(
         self,
@@ -99,6 +102,11 @@ class TopKRetriever(BaseModel):
         )  # [1, 16, q_len, k_len]
         weights, idx = torch.topk(logits, self.n_retrieved, dim=-1)  # [1, 16, q_len, n]
 
+        if self.record_indices:
+            self._indices.setdefault(layer_idx, []).append(
+                idx[0].to("cpu", torch.int32)
+            )
+
         values = values.unsqueeze(2).expand(
             -1, -1, idx.shape[2], -1, -1
         )  # [1, 16, q_len, k_len, d]
@@ -113,6 +121,16 @@ class TopKRetriever(BaseModel):
         )  # [1, 16, q_len, d]
 
         return AttentionPartition(out=out, lse=lse)
+
+    def reset_indices(self) -> None:
+        self._indices.clear()
+
+    def save_indices(self, path: Path) -> None:
+        for layer_idx, chunks in self._indices.items():
+            indices = torch.cat(chunks, dim=1)
+            save_file(
+                {"indices": indices}, str(path / f"indices_{layer_idx:02d}.safetensors")
+            )
 
 
 class QdrantRetriever(BaseModel):
@@ -358,13 +376,6 @@ class RetrievalCache(DynamicCache):
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
         )
-
-        # if query_states is not None:
-        #     cached_keys, cached_values = self.retriever.retrieve(
-        #         query_states, layer_idx, self.prefill
-        #     )
-        #     keys = torch.cat([cached_keys, keys], dim=2)
-        #     values = torch.cat([cached_values, values], dim=2)
 
         return keys, values
 

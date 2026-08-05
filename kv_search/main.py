@@ -371,6 +371,7 @@ class CmdChat(BaseModel):
     retriever: RetrieverConfig = Field(default_factory=QdrantRetriever)
     max_new_tokens: int = 256
     render_live: bool = True
+    record_indices: bool = False
 
     def cli_cmd(self) -> None:
         model, processor = _load_model(self.model_name)
@@ -380,6 +381,9 @@ class CmdChat(BaseModel):
 
         prefill, context_len = load_cache(cache_dir, model.config)
 
+        if self.record_indices and isinstance(self.retriever, TopKRetriever):
+            self.retriever.record_indices = self.record_indices
+
         cache = RetrievalCache(
             retriever=self.retriever, prefill=prefill, config=model.config
         )
@@ -387,7 +391,7 @@ class CmdChat(BaseModel):
         streamer = TimedStreamer(processor.tokenizer, skip_prompt=True)
 
         try:
-            self._repl(model, processor, cache, context_len, streamer)
+            self._repl(model, processor, cache, context_len, streamer, cache_dir)
         finally:
             _print_stats()
 
@@ -398,6 +402,7 @@ class CmdChat(BaseModel):
         cache: RetrievalCache,
         context_len: int,
         streamer: TimedStreamer,
+        cache_dir: Path,
     ) -> None:
 
         instances = {cache.retriever.type: cache.retriever}
@@ -439,6 +444,8 @@ class CmdChat(BaseModel):
                         r = _RETRIEVERS[cmd]()
                         if hasattr(r, "n_retrieved"):
                             r.n_retrieved = n_retrieved
+                        if hasattr(r, "record_indices"):
+                            r.record_indices = self.record_indices
                         instances[cmd] = r
                     cache.retriever = instances[cmd]
                     print(f"[retriever = {cmd}]")
@@ -446,12 +453,19 @@ class CmdChat(BaseModel):
                     print(f"unknown command '/{cmd}', see /help")
                 continue
 
+            record = self.record_indices and isinstance(cache.retriever, TopKRetriever)
+            if record:
+                cache.retriever.reset_indices()
+
             try:
                 self._generate(model, processor, cache, context_len, streamer, user)
             except KeyboardInterrupt:
                 streamer.end()
             finally:
                 cache.reset()
+
+            if record:
+                cache.retriever.save_indices(cache_dir)
 
     def _generate(
         self,
