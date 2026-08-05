@@ -32,6 +32,7 @@ from rich.progress import track
 # auto_docstring emits [ERROR] lines via print() at class-definition time
 with contextlib.redirect_stdout(io.StringIO()):
     from transformers import (
+        AutoConfig,
         AutoModelForCausalLM,
         AutoModelForMultimodalLM,
         AutoProcessor,
@@ -42,6 +43,7 @@ with contextlib.redirect_stdout(io.StringIO()):
         Gemma4Processor,
         Mistral3ForConditionalGeneration,
         PixtralProcessor,
+        PreTrainedConfig,
         PreTrainedTokenizerBase,
         Qwen2ForCausalLM,
         Qwen2Tokenizer,
@@ -50,6 +52,7 @@ with contextlib.redirect_stdout(io.StringIO()):
         TextStreamer,
     )
 
+from kv_search.analysis import CachedData
 from kv_search.cache import (
     FullContextRetriever,
     QdrantEdgeNativeRetriever,
@@ -501,6 +504,20 @@ class CmdChat(BaseModel):
         )  # ty:ignore[invalid-argument-type]
 
 
+class CmdAnalyze(BaseModel):
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+
+    def cli_cmd(self) -> None:
+        config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
+
+        cache_dir = Path(f"cache/{self.dataset_name}/{config.model_type}")
+        cache_dir.mkdir(exist_ok=True, parents=True)
+
+        data = CachedData(cache_dir, model_name=self.model_name)
+        data.plot_mse()
+
+
 class CmdKvSearch(
     BaseModel,
     cli_shortcuts={
@@ -515,6 +532,7 @@ class CmdKvSearch(
 ):
     prefill: CliSubCommand[CmdPrefill]
     chat: CliSubCommand[CmdChat]
+    analyze: CliSubCommand[CmdAnalyze]
 
     def cli_cmd(self) -> None:
         CliApp.run_subcommand(self)
