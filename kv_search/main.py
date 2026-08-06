@@ -460,6 +460,9 @@ class CmdChat(BaseModel):
             if record:
                 cache.retriever.reset_indices()
 
+            # isolate this prompt's timings; discard the first (cold) prompt when measuring
+            timers.reset_generation()
+            torch.cuda.reset_peak_memory_stats()
             try:
                 self._generate(model, processor, cache, context_len, streamer, user)
             except KeyboardInterrupt:
@@ -469,6 +472,8 @@ class CmdChat(BaseModel):
 
             if record:
                 cache.retriever.save_indices(cache_dir)
+
+            _print_stats()
 
     def _generate(
         self,

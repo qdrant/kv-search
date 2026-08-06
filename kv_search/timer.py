@@ -19,6 +19,10 @@ class Timer:
     def reset_lap(self):
         self._start = None
 
+    def reset(self):
+        self._start = None
+        self.timings.clear()
+
     def __enter__(self):
         self._start = time.perf_counter()
         return self
@@ -63,6 +67,13 @@ class Timers:
 
     qdrant_retrieve: Timer = field(default_factory=Timer)
     qdrant_assemble: Timer = field(default_factory=Timer)
+
+    # timers that accumulate per generation and should be cleared between prompts
+    GENERATION = ("token_gen", "qdrant_retrieve", "qdrant_assemble")
+
+    def reset_generation(self) -> None:
+        for name in self.GENERATION:
+            getattr(self, name).reset()
 
     def __rich__(self) -> Table:
         table = Table(title="timings", title_justify="left")
