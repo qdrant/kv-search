@@ -46,78 +46,99 @@ mod _native {
             let q_heads = arr.shape()[0];
             let q_len = arr.shape()[1];
 
-            let queries: Vec<(usize, Vec<f32>)> = (0..q_heads)
-                .flat_map(|qh| (0..q_len).map(move |t| (qh / 4, arr.slice(s![qh, t, ..]).to_vec())))
+            // One query per token and query head, grouped by kv head
+            let queries: Vec<(usize, Vec<Vec<f32>>)> = (0..q_heads / 4)
+                .map(|h| {
+                    (
+                        h,
+                        (0..4)
+                            .flat_map(|i| {
+                                (0..q_len).map(move |t| arr.slice(s![h * 4 + i, t, ..]).to_vec())
+                            })
+                            .collect(),
+                    )
+                })
                 .collect();
 
             // per query head and query token
-            let results: Vec<(Vec<f32>, f32)> = queries
+            let results: Vec<Vec<(Vec<f32>, f32)>> = queries
                 .into_par_iter()
-                .map(|(h, qv)| {
-                    let points = self.shards[&(layer_idx, h)]
-                        .query(QueryRequest {
-                            prefetches: vec![],
-                            query: Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery {
-                                query: qv.into(),
-                                using: Some("key".to_string()),
-                            }))),
-                            filter: None,
-                            score_threshold: None,
-                            limit: limit,
-                            offset: 0,
-                            params: None,
-                            with_vector: WithVector::Selector(vec!["value".to_string()]),
-                            with_payload: WithPayloadInterface::Bool(false),
-                        })
+                .map(|(h, qvs)| {
+                    let batch = self.shards[&(layer_idx, h)]
+                        .query_batch(
+                            qvs.into_iter()
+                                .map(|qv| QueryRequest {
+                                    prefetches: vec![],
+                                    query: Some(ScoringQuery::Vector(QueryEnum::Nearest(
+                                        NamedQuery {
+                                            query: qv.into(),
+                                            using: Some("key".to_string()),
+                                        },
+                                    ))),
+                                    filter: None,
+                                    score_threshold: None,
+                                    limit: limit,
+                                    offset: 0,
+                                    params: None,
+                                    with_vector: WithVector::Selector(vec!["value".to_string()]),
+                                    with_payload: WithPayloadInterface::Bool(false),
+                                })
+                                .collect(),
+                        )
                         .map_err(|e| e.to_string())?;
 
-                    if points.is_empty() {
-                        return Ok((Vec::new(), f32::NEG_INFINITY));
-                    }
+                    // if points.is_empty() {
+                    //     return Ok((Vec::new(), f32::NEG_INFINITY));
+                    // }
 
                     // logit_i = score_i * scaling
                     // m = max(logit_i for all i)
                     // w_i = exp(logit_i - m)
                     // lse = m + ln(sum(w_i))
                     // out = sum(w_i * v_i) / sum(w_i)
-                    let m = points
-                        .iter()
-                        .map(|p| p.score * scaling)
-                        .fold(f32::NEG_INFINITY, f32::max);
+                    batch
+                        .into_iter()
+                        .map(|points| {
+                            let m = points
+                                .iter()
+                                .map(|p| p.score * scaling)
+                                .fold(f32::NEG_INFINITY, f32::max);
 
-                    let mut out: Vec<f32> = Vec::new();
-                    let mut sum = 0.0f32;
-                    for p in points {
-                        let Some(VectorStructInternal::Named(mut named)) = p.vector else {
-                            return Err("scored point has no named vectors".to_string());
-                        };
+                            let mut out: Vec<f32> = Vec::new();
+                            let mut sum = 0.0f32;
+                            for p in points {
+                                let Some(VectorStructInternal::Named(mut named)) = p.vector else {
+                                    return Err("scored point has no named vectors".to_string());
+                                };
 
-                        let Some(VectorInternal::Dense(v)) = named.remove("value") else {
-                            return Err("no vector named 'value'".to_string());
-                        };
-                        if out.is_empty() {
-                            out = vec![0.0; v.len()];
-                        }
-                        let w = (p.score * scaling - m).exp();
-                        sum += w;
-                        for (o, x) in out.iter_mut().zip(v.iter()) {
-                            *o += w * x;
-                        }
-                    }
-                    let inv = 1.0 / sum;
-                    for o in out.iter_mut() {
-                        *o *= inv;
-                    }
-                    Ok((out, m + sum.ln()))
+                                let Some(VectorInternal::Dense(v)) = named.remove("value") else {
+                                    return Err("no vector named 'value'".to_string());
+                                };
+                                if out.is_empty() {
+                                    out = vec![0.0; v.len()];
+                                }
+                                let w = (p.score * scaling - m).exp();
+                                sum += w;
+                                for (o, x) in out.iter_mut().zip(v.iter()) {
+                                    *o += w * x;
+                                }
+                            }
+                            let inv = 1.0 / sum;
+                            for o in out.iter_mut() {
+                                *o *= inv;
+                            }
+                            Ok((out, m + sum.ln()))
+                        })
+                        .collect::<Result<Vec<_>, String>>()
                 })
                 .collect::<Result<Vec<_>, String>>()
                 .map_err(|e| PyRuntimeError::new_err(e))?;
 
-            let value_dim = results.iter().map(|(o, _)| o.len()).max().unwrap_or(0);
+            let value_dim = results.iter().flatten().map(|(o, _)| o.len()).max().unwrap_or(0);
             let mut out_flat: Vec<f32> = Vec::with_capacity(q_heads * q_len * value_dim);
             let mut lse_flat: Vec<f32> = Vec::with_capacity(q_heads * q_len);
 
-            for (out, lse) in results {
+            for (out, lse) in results.into_iter().flatten() {
                 out_flat.extend_from_slice(&out);
                 lse_flat.push(lse);
             }

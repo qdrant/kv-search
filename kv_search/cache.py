@@ -158,7 +158,7 @@ class QdrantRetriever(BaseModel):
                     query=query_states[query_idx + i, token_idx],
                     params=SearchParams(exact=True),
                     with_payload=False,
-                    with_vector=True,
+                    with_vector=["value"],
                     using="key",
                     limit=self.n_retrieved,
                 )
@@ -166,19 +166,24 @@ class QdrantRetriever(BaseModel):
                 for i in range(4)
             ],
         )
-        keys = np.array(
-            [p.vector["key"] for r in data for p in r.points],  # ty:ignore[invalid-argument-type, not-subscriptable]
+        # requests are ordered token_idx outer, q-head-in-group (i) inner
+        scores = np.array(
+            [p.score for r in data for p in r.points],
             dtype=np.float32,
-        )
+        ).reshape(query_states.shape[1], 4, self.n_retrieved)  # [q_len, 4, n]
         values = np.array(
             [p.vector["value"] for r in data for p in r.points],  # ty:ignore[invalid-argument-type, not-subscriptable]
             dtype=np.float32,
-        )
-        return keys, values
+        ).reshape(query_states.shape[1], 4, self.n_retrieved, -1)  # [q_len, 4, n, d]
+        return scores, values
 
     def retrieve(
-        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        query_states: torch.Tensor,
+        layer_idx: int,
+        prefill: DynamicCache,
+        scaling: float,
+    ) -> AttentionPartition:
         query = query_states[0].to(torch.float32).cpu().numpy()
         with timers.qdrant_retrieve:
             results = list(
@@ -186,17 +191,32 @@ class QdrantRetriever(BaseModel):
                     lambda h: self._query_head(layer_idx, h, query), range(4)
                 )
             )
-        keys = (
-            torch.from_numpy(np.stack([k for k, _ in results]))
-            .unsqueeze(0)
-            .to(query_states.device, query_states.dtype)
+
+        # [kv_head=4, q_len, i=4, n] -> [q_head=16, q_len, n]
+        scores = (
+            torch.from_numpy(np.stack([s for s, _ in results]))
+            .permute(0, 2, 1, 3)
+            .reshape(16, query.shape[1], self.n_retrieved)
+            .to(query_states.device)
         )
+        # [kv_head=4, q_len, i=4, n, d] -> [q_head=16, q_len, n, d]
         values = (
             torch.from_numpy(np.stack([v for _, v in results]))
-            .unsqueeze(0)
-            .to(query_states.device, query_states.dtype)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(16, query.shape[1], self.n_retrieved, -1)
+            .to(query_states.device)
         )
-        return keys, values
+
+        # edge score is the raw q·k dot; scale it into the attention logit
+        logits = scores * scaling  # [16, q_len, n]
+        lse = torch.logsumexp(logits, dim=-1)  # [16, q_len]
+        out = torch.einsum(
+            "hqn,hqnd->hqd", torch.softmax(logits, dim=-1), values
+        )  # [16, q_len, d]
+
+        out = out.unsqueeze(0).to(query_states.device, query_states.dtype)
+        lse = lse.unsqueeze(0).to(query_states.device, query_states.dtype)
+        return AttentionPartition(out=out, lse=lse)
 
 
 class QdrantEdgeNativeRetriever(BaseModel):
@@ -262,52 +282,69 @@ class QdrantEdgeRetriever(BaseModel):
         self, layer_idx: int, head_idx: int, query_states: npt.NDArray
     ) -> tuple[npt.NDArray, npt.NDArray]:
         query_idx = head_idx * 4
-        data = [
-            self._shard(layer_idx, head_idx).query(
+        data = self._shard(layer_idx, head_idx).query_batch(
+            [
                 edge.QueryRequest(
                     query=edge.Query.Nearest(
-                        query=query_states[query_idx + i, token_idx], using="key"
+                        query=query_states[query_idx + i, token_idx],
+                        using="key",
                     ),
                     params=edge.SearchParams(exact=True),
                     with_payload=False,
-                    with_vector=True,
+                    with_vector=["value"],
                     limit=self.n_retrieved,
                 )
-            )
-            for token_idx in range(query_states.shape[1])
-            for i in range(4)
-        ]
-        keys = np.array(
-            [p.vector["key"] for r in data for p in r],  # ty:ignore[invalid-argument-type, not-subscriptable]
-            dtype=np.float32,
+                for token_idx in range(query_states.shape[1])
+                for i in range(4)
+            ],
         )
+        # requests are ordered token_idx outer, q-head-in-group (i) inner
+        scores = np.array(
+            [p.score for r in data for p in r],
+            dtype=np.float32,
+        ).reshape(query_states.shape[1], 4, self.n_retrieved)  # [q_len, 4, n]
         values = np.array(
             [p.vector["value"] for r in data for p in r],  # ty:ignore[invalid-argument-type, not-subscriptable]
             dtype=np.float32,
-        )
-        return keys, values
+        ).reshape(query_states.shape[1], 4, self.n_retrieved, -1)  # [q_len, 4, n, d]
+        return scores, values
 
     def retrieve(
-        self, query_states: torch.Tensor, layer_idx: int, prefill: DynamicCache
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self,
+        query_states: torch.Tensor,
+        layer_idx: int,
+        prefill: DynamicCache,
+        scaling: float,
+    ) -> AttentionPartition:
         query = query_states[0].to(torch.float32).cpu().numpy()
         with timers.qdrant_retrieve:
-            # results = list(
-            #         lambda h: self._query_head(layer_idx, h, query), range(4)
-            #     )
-            # )
             results = [self._query_head(layer_idx, h, query) for h in range(4)]
-        keys = (
-            torch.from_numpy(np.stack([k for k, _ in results]))
-            .unsqueeze(0)
-            .to(query_states.device, query_states.dtype)
+
+        # [kv_head=4, q_len, i=4, n] -> [q_head=16, q_len, n]
+        scores = (
+            torch.from_numpy(np.stack([s for s, _ in results]))
+            .permute(0, 2, 1, 3)
+            .reshape(16, query.shape[1], self.n_retrieved)
+            .to(query_states.device)
         )
+        # [kv_head=4, q_len, i=4, n, d] -> [q_head=16, q_len, n, d]
         values = (
             torch.from_numpy(np.stack([v for _, v in results]))
-            .unsqueeze(0)
-            .to(query_states.device, query_states.dtype)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(16, query.shape[1], self.n_retrieved, -1)
+            .to(query_states.device)
         )
-        return keys, values
+
+        # edge score is the raw q·k dot; scale it into the attention logit
+        logits = scores * scaling  # [16, q_len, n]
+        lse = torch.logsumexp(logits, dim=-1)  # [16, q_len]
+        out = torch.einsum(
+            "hqn,hqnd->hqd", torch.softmax(logits, dim=-1), values
+        )  # [16, q_len, d]
+
+        out = out.unsqueeze(0).to(query_states.device, query_states.dtype)
+        lse = lse.unsqueeze(0).to(query_states.device, query_states.dtype)
+        return AttentionPartition(out=out, lse=lse)
 
 
 RetrieverConfig = Annotated[
