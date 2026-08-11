@@ -8,8 +8,8 @@ mod _native {
     use pyo3::exceptions::PyRuntimeError;
     use pyo3::prelude::*;
     use qdrant_edge::{
-        EdgeShard, NamedQuery, QueryEnum, QueryRequest, ScoringQuery, VectorInternal,
-        VectorStructInternal, WithPayloadInterface, WithVector,
+        EdgeConfigBuilder, EdgeShard, NamedQuery, QueryEnum, QueryRequest, ScoringQuery, SearchParams,
+        VectorInternal, VectorStructInternal, WithPayloadInterface, WithVector,
     };
     use rayon::prelude::*;
 
@@ -25,8 +25,12 @@ mod _native {
             let shards = shards
                 .into_iter()
                 .map(|(k, p)| {
-                    let v = EdgeShard::load(Path::new(&p), None)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    // somewhat empirical, also might need to go back to sequential for hnsw
+                    let v = EdgeShard::load(
+                        Path::new(&p),
+                        Some(EdgeConfigBuilder::new().max_search_threads(8).build()),
+                    )
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                     Ok((k, v))
                 })
                 .collect::<PyResult<HashMap<_, _>>>()?;
@@ -79,17 +83,13 @@ mod _native {
                                     score_threshold: None,
                                     limit: limit,
                                     offset: 0,
-                                    params: None,
+                                    params: Some(SearchParams { exact: true, ..Default::default() }),
                                     with_vector: WithVector::Selector(vec!["value".to_string()]),
                                     with_payload: WithPayloadInterface::Bool(false),
                                 })
                                 .collect(),
                         )
                         .map_err(|e| e.to_string())?;
-
-                    // if points.is_empty() {
-                    //     return Ok((Vec::new(), f32::NEG_INFINITY));
-                    // }
 
                     // logit_i = score_i * scaling
                     // m = max(logit_i for all i)
