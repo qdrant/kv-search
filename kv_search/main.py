@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 import shutil
 import sys
@@ -411,6 +412,8 @@ class CmdChat(BaseModel):
         instances = {cache.retriever.type: cache.retriever}
         n_retrieved = getattr(cache.retriever, "n_retrieved", 128)
 
+        prompt_idx = 0
+
         while True:
             try:
                 streamer.reset(render_live=self.render_live)
@@ -464,14 +467,22 @@ class CmdChat(BaseModel):
             timers.reset_generation()
             torch.cuda.reset_peak_memory_stats()
             try:
-                self._generate(model, processor, cache, context_len, streamer, user)
+                prompt_len = self._generate(
+                    model, processor, cache, context_len, streamer, user
+                )
+                if record:
+                    # save per prompt, store prompt length with it
+                    tmp = cache_dir / f"indices{prompt_idx:02d}"
+                    tmp.mkdir(exist_ok=True)
+                    (tmp / "meta.json").write_text(
+                        json.dumps({"prompt_len": prompt_len})
+                    )
+                    cache.retriever.save_indices(tmp)
+                prompt_idx += 1
             except KeyboardInterrupt:
                 streamer.end()
             finally:
                 cache.reset()
-
-            if record:
-                cache.retriever.save_indices(cache_dir)
 
             _print_stats()
 
@@ -483,7 +494,7 @@ class CmdChat(BaseModel):
         context_len: int,
         streamer: TimedStreamer,
         user: str,
-    ):
+    ) -> int:
         inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
             add_generation_prompt=True,
@@ -508,6 +519,8 @@ class CmdChat(BaseModel):
             streamer=streamer,
         )  # ty:ignore[invalid-argument-type]
 
+        return prompt_len
+
 
 class CmdAnalyze(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
@@ -521,8 +534,7 @@ class CmdAnalyze(BaseModel):
 
         data = CachedData(cache_dir, model_name=self.model_name)
         # data.plot_mse()
-        # data.plot_indices()
-        data.index_stats()
+        data.report()
 
 
 class CmdKvSearch(
