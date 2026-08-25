@@ -41,6 +41,8 @@ module-name = "kv_search._native"
 
 [dependency-groups]
 dev = [
+    "ipython>=9.16.1",
+    "jupytext>=1.19.5",
     "maturin>=1.14.1",
     "ninja>=1.13.0",
 ]
