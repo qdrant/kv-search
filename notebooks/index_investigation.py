@@ -27,7 +27,7 @@ def md_table(headers, rows) -> Markdown:
     return Markdown("\n".join([esc(headers), sep, *(esc(r) for r in rows)]))
 
 
-data = CachedData(Path("cache/qdrant/qwen3_5"), model_name="Qwen/Qwen3.5-9B")
+data = CachedData(Path("../cache/qdrant/qwen3_5"), model_name="Qwen/Qwen3.5-9B")
 print(f"context length: {data.context_len} tokens")
 
 # %% [markdown]
@@ -43,7 +43,7 @@ print(f"context length: {data.context_len} tokens")
 # reason retrieval works.
 
 # %%
-data.plot_mse()
+_ = data.plot_mse()
 
 # %% [markdown]
 # ## 2. Which context positions get retrieved?
@@ -57,7 +57,7 @@ data.plot_mse()
 # concentrated and stable, not roaming the whole context.
 
 # %%
-data.plot_indices_heatmap()
+_ = data.plot_indices_heatmap()
 
 # %% [markdown]
 # ## 3. Per-layer summary
@@ -89,7 +89,7 @@ display(md_table(*data.index_stats()))
 # is something it already fetched earlier — only a small slice is new.
 
 # %%
-data.plot_indices_unique_per_generation()
+_ = data.plot_indices_unique_per_generation()
 
 # %% [markdown]
 # ## 5. Retrieved (fixed) context vs the live (dynamic) context
@@ -110,7 +110,7 @@ data.plot_indices_unique_per_generation()
 # is roughly a constant offset, not something that keeps growing over generation.
 
 # %%
-data.plot_scores()
+_ = data.plot_scores()
 
 # %% [markdown]
 # ## 6. Do neighbouring layers retrieve the same positions? (prefetch)
