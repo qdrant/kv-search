@@ -42,6 +42,7 @@ from kv_search.timer import timers
 class AttentionPartition:
     out: torch.Tensor
     lse: torch.Tensor
+    weights: torch.Tensor | None = None
 
 
 class Retriever(Protocol):
@@ -81,6 +82,8 @@ class TopKRetriever(BaseModel):
     n_retrieved: int = 128
     record_indices: bool = False
     _indices: dict[int, list[torch.Tensor]] = PrivateAttr(default_factory=dict)
+    _scores: dict[int, list[torch.Tensor]] = PrivateAttr(default_factory=dict)
+    _dynamic_scores: dict[int, list[torch.Tensor]] = PrivateAttr(default_factory=dict)
 
     def retrieve(
         self,
@@ -106,6 +109,9 @@ class TopKRetriever(BaseModel):
             self._indices.setdefault(layer_idx, []).append(
                 idx[0].to("cpu", torch.int32)
             )
+            self._scores.setdefault(layer_idx, []).append(
+                weights[0].to("cpu", torch.float32)
+            )
 
         values = values.unsqueeze(2).expand(
             -1, -1, idx.shape[2], -1, -1
@@ -125,11 +131,21 @@ class TopKRetriever(BaseModel):
     def reset_indices(self) -> None:
         self._indices.clear()
 
+    def record_dynamic_scores(self, layer_idx: int, scores: torch.Tensor) -> None:
+        self._dynamic_scores.setdefault(layer_idx, []).append(
+            scores[0].to("cpu", torch.float32)
+        )
+
     def save_indices(self, path: Path) -> None:
         for layer_idx, chunks in self._indices.items():
             indices = torch.cat(chunks, dim=1)
+            scores = torch.cat(self._scores[layer_idx], dim=1)
+            max_len = max(x.shape[-1] for x in self._dynamic_scores[layer_idx])
+            for i, t in enumerate(self._dynamic_scores[layer_idx]):
+                self._dynamic_scores[layer_idx][i] = torch.cat([t, torch.full((t.shape[0], t.shape[1], max_len - t.shape[2]), torch.nan)], dim=2)
+            dynamic_scores = torch.cat(self._dynamic_scores[layer_idx], dim=1)
             save_file(
-                {"indices": indices}, str(path / f"indices_{layer_idx:02d}.safetensors")
+                    {"indices": indices, "scores": scores, "dynamic_scores": dynamic_scores}, str(path / f"indices_{layer_idx:02d}.safetensors")
             )
 
 
@@ -630,6 +646,7 @@ def _partition_attend(
     value: torch.Tensor,
     scaling: float,
     mask: torch.Tensor | None = None,
+    return_weights: bool = False,
 ) -> AttentionPartition:
     key_states = _repeat_kv(key, 4).to(torch.float32)
     value_states = _repeat_kv(value, 4).to(torch.float32)
@@ -644,7 +661,7 @@ def _partition_attend(
     lse = torch.logsumexp(attn_weights, dim=-1)
     out = torch.matmul(torch.softmax(attn_weights, dim=-1), value_states)
 
-    return AttentionPartition(out=out, lse=lse)
+    return AttentionPartition(out=out, lse=lse, weights=attn_weights if return_weights else None)
 
 
 def _merge_partitions(
@@ -711,9 +728,13 @@ def _qwen_3_5_forward(
             query_states.dtype,
             query_states.device,
         )
+        should_record_scores = isinstance(past_key_values.retriever, TopKRetriever) and past_key_values.retriever.record_indices
         live = _partition_attend(
-            query_states, key_states, value_states, self.scaling, live_mask
+            query_states, key_states, value_states, self.scaling, live_mask, return_weights=should_record_scores
         )
+
+        if should_record_scores and live.weights is not None:
+            past_key_values.retriever.record_dynamic_scores(self.layer_idx, live.weights)
 
         attn_output = _merge_partitions(
             live.out, live.lse, retrieved.out, retrieved.lse
