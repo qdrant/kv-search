@@ -6,11 +6,19 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 import qdrant_edge as edge
 import requests
 from qdrant_client import QdrantClient
-from qdrant_client.models import Batch, Distance, HnswConfigDiff, VectorParams
+from qdrant_client.models import (
+    CollectionStatus,
+    Distance,
+    HnswConfigDiff,
+    OptimizersConfigDiff,
+    VectorParams,
+    VectorParamsDiff,
+)
 from qdrant_client.qdrant_remote import QdrantRemote
 from rich.live import Live
 from rich.markdown import Markdown
@@ -241,13 +249,15 @@ def _do_prefill(
 def _upsert(
     cache: RecordingCache,
     url: str,
-    batch_size: int = 128,
+    batch_size: int = 1024,
     api_key: str | None = None,
     edge_root: Path = Path("cache/edge"),
+    parallel: int = 4,
 ):
     edge_root.mkdir(parents=True, exist_ok=True)
-    client = QdrantClient(url, api_key=api_key)
-    assert isinstance(client._client, QdrantRemote)
+    client = QdrantClient(url, api_key=api_key, prefer_grpc=True)
+    rest = QdrantClient(url, api_key=api_key)
+    assert isinstance(rest._client, QdrantRemote)
     for i, layer in track(
         enumerate(cache.layers), description="Upserting", total=len(cache.layers)
     ):
@@ -255,48 +265,54 @@ def _upsert(
             continue
 
         for h in track(range(4), transient=True, description="Head"):
-            if client.collection_exists(f"layer={i};head={h}"):
-                client.delete_collection(f"layer={i};head={h}")
+            name = f"layer={i};head={h}"
+            if client.collection_exists(name):
+                client.delete_collection(name)
 
             assert layer.keys is not None
             assert layer.values is not None
+            d = layer.keys.shape[-1]
+            n = layer.keys.shape[2]
 
             client.create_collection(
-                collection_name=f"layer={i};head={h}",
+                collection_name=name,
                 vectors_config={
                     "key": VectorParams(
-                        size=layer.keys.shape[-1], distance=Distance.DOT
+                        size=d,
+                        distance=Distance.DOT,
+                        on_disk=True,
+                        hnsw_config=HnswConfigDiff(m=0, on_disk=True),
                     ),
                     "value": VectorParams(
-                        size=layer.keys.shape[-1],
+                        size=d,
                         distance=Distance.DOT,
+                        on_disk=True,
                         hnsw_config=HnswConfigDiff(m=0),
                     ),
                 },
+                optimizers_config=OptimizersConfigDiff(indexing_threshold=0),
             )
 
-            ids = torch.split(
-                torch.arange(layer.keys.shape[2], dtype=torch.int), batch_size
+            client.upload_collection(
+                collection_name=name,
+                ids=range(n),
+                vectors={
+                    "key": layer.keys[0, h].to(torch.float).cpu().numpy(),
+                    "value": layer.values[0, h].to(torch.float).cpu().numpy(),
+                },
+                batch_size=batch_size,
+                parallel=parallel,
+                wait=False,
             )
-            keys = torch.split(layer.keys[0, h].cpu().to(torch.float), batch_size)
-            values = torch.split(layer.values[0, h].cpu().to(torch.float), batch_size)
 
-            for idx, k, v in track(
-                zip(ids, keys, values),
-                total=len(keys),
-                transient=True,
-                description="Batch",
-            ):
-                client.upsert(
-                    collection_name=f"layer={i};head={h}",
-                    points=Batch(
-                        ids=idx.tolist(),
-                        vectors={
-                            "key": k.numpy(),
-                            "value": v.numpy(),
-                        },
-                    ),
-                )
+            client.update_collection(
+                collection_name=name,
+                vectors_config={
+                    "key": VectorParamsDiff(hnsw_config=HnswConfigDiff(m=16))
+                },
+                optimizers_config=OptimizersConfigDiff(indexing_threshold=20000),
+            )
+            _wait_indexed(client, name)
 
             shard_dir = edge_root / f"layer{i:02d}_head{h}"
 
@@ -304,13 +320,13 @@ def _upsert(
                 snapshot_path = Path(restore_dir) / "shard.snapshot"
 
                 with requests.get(
-                    f"{client._client.rest_uri}/collections/layer={i};head={h}/shards/0/snapshot",
+                    f"{rest._client.rest_uri}/collections/{name}/shards/0/snapshot",
                     headers={"api-key": api_key} if api_key else None,
                     stream=True,
                 ) as r:
                     r.raise_for_status()
                     with open(snapshot_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
+                        for chunk in r.iter_content(chunk_size=1 << 20):
                             f.write(chunk)
 
                 if shard_dir.exists():
@@ -318,6 +334,13 @@ def _upsert(
                 shard_dir.mkdir(parents=True, exist_ok=True)
 
                 edge.EdgeShard.unpack_snapshot(str(snapshot_path), str(shard_dir))
+
+            client.delete_collection(name)
+
+
+def _wait_indexed(client: QdrantClient, name: str) -> None:
+    while client.get_collection(name).status != CollectionStatus.GREEN:
+        time.sleep(0.5)
 
 
 def _print_stats():
@@ -385,7 +408,7 @@ class CmdPrefill(BaseModel):
     upsert: bool = False
     url: str = "localhost"
     api_key: str | None = None
-    upsert_batch_size: int = 128
+    upsert_batch_size: int = 1024
     prefill_batch_size: int = 4096
 
     def cli_cmd(self) -> None:
