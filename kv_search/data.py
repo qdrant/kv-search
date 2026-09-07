@@ -19,8 +19,14 @@ class Message(BaseModel):
     query: list[dict[str, Any]]
 
 
-def load_dataset(dataset_name: Datasets, multimodal: bool = False) -> Message:
-    """Build one 100k token context message for prefill and a corresponding query message."""
+def load_dataset(
+    dataset_name: Datasets, multimodal: bool = False, qdrant_size: str = "100k"
+) -> Message:
+    """Build one context message for prefill and a corresponding query message.
+
+    ``qdrant_size`` selects the qdrant codebase-summary tier
+    (``cache/CODEBASE_SUMMARY_{qdrant_size}.md``): one of 100k/200k/400k/600k/800k/1M.
+    """
 
     if dataset_name == Datasets.SQUAD:
         ds = datasets.load_dataset("rajpurkar/squad", split="train")
@@ -61,10 +67,10 @@ def load_dataset(dataset_name: Datasets, multimodal: bool = False) -> Message:
                 message["content"] = [{"type": "text", "text": message["content"]}]
         return Message(prefill=messages[:-1], query=[messages[-1]])
     elif dataset_name == Datasets.QDRANT:
-        path = Path("./cache/CODEBASE_SUMMARY.md")
+        path = Path(f"./cache/CODEBASE_SUMMARY_{qdrant_size}.md")
 
         if not path.is_file():
-            raise RuntimeError
+            raise RuntimeError(f"missing summary tier: {path}")
         with path.open("rt") as f:
             data = f.read()
 

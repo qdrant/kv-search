@@ -238,6 +238,7 @@ class QdrantRetriever(BaseModel):
 class QdrantEdgeNativeRetriever(BaseModel):
     type: Literal["native"] = "native"
     n_retrieved: int = 128
+    edge_root: str = "cache/edge"
 
     @cached_property
     def _engine(self) -> NativeEdgeRetriever:
@@ -245,7 +246,7 @@ class QdrantEdgeNativeRetriever(BaseModel):
             [
                 (
                     (layer_idx, head_idx),
-                    f"cache/edge/layer{layer_idx:02d}_head{head_idx}",
+                    f"{self.edge_root}/layer{layer_idx:02d}_head{head_idx}",
                 )
                 for layer_idx in range(3, 32, 4)
                 for head_idx in range(4)
@@ -283,6 +284,7 @@ class QdrantEdgeNativeRetriever(BaseModel):
 class QdrantEdgeRetriever(BaseModel):
     type: Literal["edge"] = "edge"
     n_retrieved: int = 128
+    edge_root: str = "cache/edge"
 
     _shards: dict[tuple[int, int], edge.EdgeShard] = PrivateAttr(default_factory=dict)
 
@@ -290,7 +292,7 @@ class QdrantEdgeRetriever(BaseModel):
         key = (layer_idx, head_idx)
         if key in self._shards:
             return self._shards[key]
-        shard = edge.EdgeShard.load(f"cache/edge/layer{layer_idx:02d}_head{head_idx}")
+        shard = edge.EdgeShard.load(f"{self.edge_root}/layer{layer_idx:02d}_head{head_idx}")
         self._shards[key] = shard
         return shard
 

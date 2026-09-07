@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import math
 import os
 import shutil
 import sys
@@ -114,26 +115,71 @@ _ATTN_IMPL = (
 )
 
 
+NATIVE_MAX_POSITIONS = 262_144  # Qwen3.5 native context window (no YaRN)
+
+
+def _size_to_tokens(label: str) -> int:
+    """'100k' -> 100_000, '1M' -> 1_000_000."""
+    s = label.strip().lower()
+    if s.endswith("m"):
+        return int(float(s[:-1]) * 1_000_000)
+    if s.endswith("k"):
+        return int(float(s[:-1]) * 1_000)
+    return int(s)
+
+
+def _yarn_factor(context_tokens: int) -> int:
+    """Smallest integer YaRN factor covering the context; 1 (=> no YaRN) at or
+    below the native window. Applied only per-tier so sub-native runs stay
+    undistorted (static YaRN degrades short contexts)."""
+    return max(1, math.ceil(context_tokens / NATIVE_MAX_POSITIONS))
+
+
 @timers.model_load
-def _load_model(model_name: ModelName) -> tuple[ModelType, ProcessorType]:
+def _load_model(
+    model_name: ModelName, context_tokens: int = 0
+) -> tuple[ModelType, ProcessorType]:
+    config = AutoConfig.from_pretrained(model_name)
+
+    factor = _yarn_factor(context_tokens)
+    if factor > 1:
+        # nested text_config for multimodal Qwen3.5; fall back to top-level
+        text_cfg = getattr(config, "text_config", config)
+        text_cfg.rope_scaling = {
+            "rope_type": "yarn",
+            "factor": float(factor),
+            "original_max_position_embeddings": NATIVE_MAX_POSITIONS,
+        }
+        console.print(
+            f"[yellow]YaRN enabled: factor={factor} "
+            f"(context ~{context_tokens:,} > native {NATIVE_MAX_POSITIONS:,})[/]"
+        )
+
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
+    load_kwargs = dict(
+        config=config,
+        attn_implementation=_ATTN_IMPL,
+        dtype=torch.bfloat16,
+        device_map="cuda",
+    )
     if model_name in IS_MULTIMODAL:
         model: ModelType = AutoModelForMultimodalLM.from_pretrained(
-            model_name,
-            attn_implementation=_ATTN_IMPL,
-            dtype=torch.bfloat16,
-            device_map="cuda",
+            model_name, **load_kwargs
         ).eval()
     else:
         model: ModelType = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            attn_implementation=_ATTN_IMPL,
-            dtype=torch.bfloat16,
-            device_map="cuda",
+            model_name, **load_kwargs
         ).eval()
 
     bind_query_aware_cache(model)
     return model, processor
+
+
+def _cache_dir(dataset_name: Datasets, qdrant_size: str, model_type: str) -> Path:
+    """Namespace artifacts by tier so all qdrant sizes coexist on disk."""
+    if dataset_name == Datasets.QDRANT:
+        return Path(f"cache/{dataset_name}/{qdrant_size}/{model_type}")
+    return Path(f"cache/{dataset_name}/{model_type}")
 
 
 @timers.prefill_gen
@@ -191,8 +237,13 @@ def _do_prefill(
 
 
 def _upsert(
-    cache: RecordingCache, url: str, batch_size: int = 128, api_key: str | None = None
+    cache: RecordingCache,
+    url: str,
+    batch_size: int = 128,
+    api_key: str | None = None,
+    edge_root: Path = Path("cache/edge"),
 ):
+    edge_root.mkdir(parents=True, exist_ok=True)
     client = QdrantClient(url, api_key=api_key)
     assert isinstance(client._client, QdrantRemote)
     for i, layer in track(
@@ -245,7 +296,7 @@ def _upsert(
                     ),
                 )
 
-            shard_dir = Path("cache") / "edge" / f"layer{i:02d}_head{h}"
+            shard_dir = edge_root / f"layer{i:02d}_head{h}"
 
             with tempfile.TemporaryDirectory(dir=shard_dir.parent) as restore_dir:
                 snapshot_path = Path(restore_dir) / "shard.snapshot"
@@ -328,6 +379,7 @@ class CacheImpl(Enum):
 class CmdPrefill(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
+    qdrant_size: str = "100k"
     upsert: bool = False
     url: str = "localhost"
     api_key: str | None = None
@@ -335,14 +387,23 @@ class CmdPrefill(BaseModel):
     prefill_batch_size: int = 4096
 
     def cli_cmd(self) -> None:
-        model, processor = _load_model(self.model_name)
+        context_tokens = (
+            _size_to_tokens(self.qdrant_size)
+            if self.dataset_name == Datasets.QDRANT
+            else 0
+        )
+        model, processor = _load_model(self.model_name, context_tokens)
 
-        cache_dir = Path(f"cache/{self.dataset_name}/{model.config.model_type}")
+        cache_dir = _cache_dir(
+            self.dataset_name, self.qdrant_size, model.config.model_type
+        )
         cache_dir.mkdir(exist_ok=True, parents=True)
 
         cache = RecordingCache(path=cache_dir, config=model.config)
         messages = load_dataset(
-            self.dataset_name, multimodal=self.model_name in IS_MULTIMODAL
+            self.dataset_name,
+            multimodal=self.model_name in IS_MULTIMODAL,
+            qdrant_size=self.qdrant_size,
         )
 
         _do_prefill(messages, model, processor, cache, self.prefill_batch_size)
@@ -355,7 +416,13 @@ class CmdPrefill(BaseModel):
         cache.finalize()
 
         if self.upsert:
-            _upsert(cache, self.url, self.upsert_batch_size, api_key=self.api_key)
+            _upsert(
+                cache,
+                self.url,
+                self.upsert_batch_size,
+                api_key=self.api_key,
+                edge_root=cache_dir / "edge",
+            )
 
         _print_stats()
 
@@ -372,18 +439,30 @@ _RETRIEVERS: dict[str, type[RetrieverConfig]] = {
 class CmdChat(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
+    qdrant_size: str = "100k"
     retriever: RetrieverConfig = Field(default_factory=QdrantRetriever)
     max_new_tokens: int = 256
     render_live: bool = True
     record_indices: bool = False
 
     def cli_cmd(self) -> None:
-        model, processor = _load_model(self.model_name)
+        context_tokens = (
+            _size_to_tokens(self.qdrant_size)
+            if self.dataset_name == Datasets.QDRANT
+            else 0
+        )
+        model, processor = _load_model(self.model_name, context_tokens)
 
-        cache_dir = Path(f"cache/{self.dataset_name}/{model.config.model_type}")
+        cache_dir = _cache_dir(
+            self.dataset_name, self.qdrant_size, model.config.model_type
+        )
         cache_dir.mkdir(exist_ok=True, parents=True)
 
         prefill, context_len = load_cache(cache_dir, model.config)
+
+        # point edge/native retrievers at this tier's shard folder
+        if hasattr(self.retriever, "edge_root"):
+            self.retriever.edge_root = str(cache_dir / "edge")
 
         if self.record_indices and isinstance(self.retriever, TopKRetriever):
             self.retriever.record_indices = self.record_indices
@@ -452,6 +531,8 @@ class CmdChat(BaseModel):
                             r.n_retrieved = n_retrieved
                         if hasattr(r, "record_indices"):
                             r.record_indices = self.record_indices
+                        if hasattr(r, "edge_root"):
+                            r.edge_root = str(cache_dir / "edge")
                         instances[cmd] = r
                     cache.retriever = instances[cmd]
                     print(f"[retriever = {cmd}]")
@@ -525,11 +606,12 @@ class CmdChat(BaseModel):
 class CmdAnalyze(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
+    qdrant_size: str = "100k"
 
     def cli_cmd(self) -> None:
         config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
 
-        cache_dir = Path(f"cache/{self.dataset_name}/{config.model_type}")
+        cache_dir = _cache_dir(self.dataset_name, self.qdrant_size, config.model_type)
         cache_dir.mkdir(exist_ok=True, parents=True)
 
         data = CachedData(cache_dir, model_name=self.model_name)
@@ -544,6 +626,7 @@ class CmdKvSearch(
         "max-new-tokens": "g",
         "model-name": "m",
         "dataset-name": "d",
+        "qdrant-size": "s",
         "retriever.api-key": "api-key",
         "retriever.type": "r",
     },
