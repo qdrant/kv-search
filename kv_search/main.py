@@ -26,6 +26,9 @@ from transformers.cache_utils import CacheLayerMixin
 
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 
+# without this unusable reserved memory goes crazy during prefill
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import importlib.util
 from enum import Enum, auto
 from pathlib import Path
@@ -293,12 +296,13 @@ def _upsert(
                 optimizers_config=OptimizersConfigDiff(indexing_threshold=0),
             )
 
+            # convert on CPU so no f32 temp lands in GPU/unified memory
             client.upload_collection(
                 collection_name=name,
                 ids=range(n),
                 vectors={
-                    "key": layer.keys[0, h].to(torch.float).cpu().numpy(),
-                    "value": layer.values[0, h].to(torch.float).cpu().numpy(),
+                    "key": layer.keys[0, h].cpu().float().numpy(),
+                    "value": layer.values[0, h].cpu().float().numpy(),
                 },
                 batch_size=batch_size,
                 parallel=parallel,
@@ -441,6 +445,8 @@ class CmdPrefill(BaseModel):
         cache.finalize()
 
         if self.upsert:
+            del model, processor
+            torch.cuda.empty_cache()
             _upsert(
                 cache,
                 self.url,
