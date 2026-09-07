@@ -145,14 +145,16 @@ def _load_model(
     if factor > 1:
         # nested text_config for multimodal Qwen3.5; fall back to top-level
         text_cfg = getattr(config, "text_config", config)
-        text_cfg.rope_scaling = {
-            "rope_type": "yarn",
-            "factor": float(factor),
-            "original_max_position_embeddings": NATIVE_MAX_POSITIONS,
-        }
+        # keep rope_theta / mrope_* / partial_rotary_factor, only flip to YaRN
+        rope = dict(getattr(text_cfg, "rope_parameters", None) or {})
+        rope["rope_type"] = "yarn"
+        rope["factor"] = float(factor)
+        rope["original_max_position_embeddings"] = NATIVE_MAX_POSITIONS
+        text_cfg.rope_parameters = rope
         console.print(
             f"[yellow]YaRN enabled: factor={factor} "
-            f"(context ~{context_tokens:,} > native {NATIVE_MAX_POSITIONS:,})[/]"
+            f"(context ~{context_tokens:,} > native {NATIVE_MAX_POSITIONS:,}); "
+            f"rope={rope}[/]"
         )
 
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
