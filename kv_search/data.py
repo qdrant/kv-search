@@ -1,5 +1,7 @@
-from enum import StrEnum
 import json
+import warnings
+from collections.abc import Iterator
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,62 @@ class Datasets(StrEnum):
 class Message(BaseModel):
     prefill: list[dict[str, Any]]
     query: list[dict[str, Any]]
+
+
+class EvalExample(BaseModel):
+    prefill: list[dict[str, Any]]
+    query: list[dict[str, Any]]
+    label: str
+    bucket: int
+    lang: str
+    idx: int
+
+
+def _wrap_multimodal(messages: list[dict[str, Any]]) -> None:
+    for message in messages:
+        if isinstance(message["content"], str):
+            message["content"] = [{"type": "text", "text": message["content"]}]
+
+
+def load_niah_examples(
+    lang: str = "english",
+    bucket: int = 71680,
+    limit: int = 0,
+    multimodal: bool = False,
+) -> Iterator[EvalExample]:
+    """Yield scorable examples from one MR-NIAH bucket. limit=0 means all."""
+
+    local_dir = Path(snapshot_download("MiniMaxAI/MR-NIAH", repo_type="dataset"))
+    data_file = local_dir / lang / f"{bucket}_tokens.jsonl"
+    if not data_file.is_file():
+        raise RuntimeError(f"missing MR-NIAH file: {data_file}")
+
+    yielded = 0
+    with data_file.open("rt", encoding="utf-8") as f:
+        for line_no, line in enumerate(f):
+            if not line.strip():
+                continue
+            if limit and yielded >= limit:
+                break
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as e:
+                # shipped files have a truncated final record
+                warnings.warn(f"{data_file.name}: skip malformed line {line_no}: {e}")
+                continue
+
+            messages = data["messages"]
+            if multimodal:
+                _wrap_multimodal(messages)
+            yield EvalExample(
+                prefill=messages[:-1],
+                query=[messages[-1]],
+                label=data["label"],
+                bucket=bucket,
+                lang=lang,
+                idx=line_no,
+            )
+            yielded += 1
 
 
 def load_dataset(

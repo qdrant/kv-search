@@ -22,7 +22,7 @@ from qdrant_client.models import (
 from qdrant_client.qdrant_remote import QdrantRemote
 from rich.live import Live
 from rich.markdown import Markdown
-from transformers.cache_utils import CacheLayerMixin
+from transformers.cache_utils import CacheLayerMixin, DynamicCache
 
 os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 
@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import CliApp, CliSubCommand
 from rich.console import Console
 from rich.progress import track
+from rich.table import Table
 
 # auto_docstring emits [ERROR] lines via print() at class-definition time
 with contextlib.redirect_stdout(io.StringIO()):
@@ -79,7 +80,13 @@ from kv_search.cache import (
     load_cache,
     save_cache,
 )
-from kv_search.data import Datasets, Message, load_dataset
+from kv_search.data import (
+    Datasets,
+    EvalExample,
+    load_dataset,
+    load_niah_examples,
+)
+from kv_search.eval import EvalRow, score_row
 from kv_search.timer import timers
 
 transformers.utils.logging.set_verbosity(transformers.utils.logging.CRITICAL)
@@ -197,19 +204,11 @@ def _cache_dir(dataset_name: Datasets, qdrant_size: str, model_type: str) -> Pat
 
 @timers.prefill_gen
 def _do_prefill(
-    messages: Message,
+    inputs: BatchEncoding,
     model: ModelType,
-    processor: ProcessorType,
-    past_key_values: RecordingCache,
+    past_key_values: DynamicCache,
     batch_size: int = 4096,
 ):
-    inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
-        messages.prefill,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    )  # ty:ignore[invalid-assignment]
     input_chunks = torch.split(inputs["input_ids"], batch_size, -1)
     attention_masks = torch.split(inputs["attention_mask"], batch_size, -1)
     if "mm_token_type_ids" in inputs:
@@ -330,8 +329,7 @@ def _upsert(
                 ) as r:
                     r.raise_for_status()
                     with open(snapshot_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=1 << 20):
-                            f.write(chunk)
+                        f.writelines(r.iter_content(chunk_size=1 << 20))
 
                 if shard_dir.exists():
                     shutil.rmtree(shard_dir)
@@ -435,7 +433,14 @@ class CmdPrefill(BaseModel):
             qdrant_size=self.qdrant_size,
         )
 
-        _do_prefill(messages, model, processor, cache, self.prefill_batch_size)
+        inputs: BatchEncoding = processor.apply_chat_template(
+            messages.prefill,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )  # ty:ignore[invalid-assignment]
+        _do_prefill(inputs, model, cache, self.prefill_batch_size)
 
         save_cache(
             cache,
@@ -492,7 +497,9 @@ class CmdChat(BaseModel):
         prefill, context_len = load_cache(cache_dir, model.config)
 
         # point edge/native retrievers at this tier's shard folder
-        if hasattr(self.retriever, "edge_root"):
+        if isinstance(
+            self.retriever, (QdrantEdgeRetriever, QdrantEdgeNativeRetriever)
+        ):
             self.retriever.edge_root = str(cache_dir / "edge")
 
         if self.record_indices and isinstance(self.retriever, TopKRetriever):
@@ -558,11 +565,11 @@ class CmdChat(BaseModel):
                 elif cmd in _RETRIEVERS:
                     if cmd not in instances:
                         r = _RETRIEVERS[cmd]()
-                        if hasattr(r, "n_retrieved"):
+                        if not isinstance(r, FullContextRetriever):
                             r.n_retrieved = n_retrieved
-                        if hasattr(r, "record_indices"):
+                        if isinstance(r, TopKRetriever):
                             r.record_indices = self.record_indices
-                        if hasattr(r, "edge_root"):
+                        if isinstance(r, (QdrantEdgeRetriever, QdrantEdgeNativeRetriever)):
                             r.edge_root = str(cache_dir / "edge")
                         instances[cmd] = r
                     cache.retriever = instances[cmd]
@@ -649,6 +656,190 @@ class CmdAnalyze(BaseModel):
         data.analyze()
 
 
+def _encode_eval(
+    processor: ProcessorType, ex: EvalExample
+) -> tuple[BatchEncoding, int]:
+    # render once and split at the final user turn, so prefill is a true prefix
+    # of the decode input (rendering prefill separately drifts on Qwen's per-turn
+    # think handling)
+    enc: BatchEncoding = processor.apply_chat_template(
+        ex.prefill + ex.query,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        enable_thinking=False,
+    )  # ty:ignore[invalid-assignment]
+    ids = enc["input_ids"][0].tolist()
+    im_start = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
+    user_tok = processor.tokenizer.encode("user", add_special_tokens=False)[0]
+    starts = [i for i in range(len(ids) - 1) if ids[i] == im_start and ids[i + 1] == user_tok]
+    if not starts:
+        raise RuntimeError("could not locate final user turn in render")
+    return enc, starts[-1]
+
+
+def _slice_inputs(enc: BatchEncoding, end: int) -> BatchEncoding:
+    out = {
+        "input_ids": enc["input_ids"][:, :end],
+        "attention_mask": enc["attention_mask"][:, :end],
+    }
+    if "mm_token_type_ids" in enc:
+        out["mm_token_type_ids"] = enc["mm_token_type_ids"][:, :end]
+    return BatchEncoding(out)
+
+
+@torch.no_grad()
+def _eval_generate(
+    model: ModelType,
+    processor: ProcessorType,
+    cache: RetrievalCache,
+    context_len: int,
+    enc_full: BatchEncoding,
+    n: int,
+    max_new_tokens: int,
+) -> str:
+    query_ids = enc_full["input_ids"][:, n:].to(model.device)
+    q_len = query_ids.shape[1]
+    gen_kwargs: dict[str, Any] = {
+        "input_ids": query_ids,
+        "attention_mask": torch.ones((1, q_len), device=model.device),
+        "position_ids": torch.arange(
+            context_len, context_len + q_len, device=model.device
+        ).unsqueeze(0),
+    }
+    if "mm_token_type_ids" in enc_full:
+        gen_kwargs["mm_token_type_ids"] = enc_full["mm_token_type_ids"][:, n:].to(
+            model.device
+        )
+
+    out = model.generate(  # ty:ignore[invalid-argument-type]
+        **gen_kwargs,
+        max_new_tokens=max_new_tokens,
+        past_key_values=cache,
+        use_cache=True,
+        do_sample=False,
+    )
+    return processor.tokenizer.decode(out[0, q_len:], skip_special_tokens=True)
+
+
+class CmdEval(BaseModel):
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    lang: str = "english"
+    buckets: str = "71680"
+    n_retrieved: int = 128
+    max_new_tokens: int = 128
+    limit_examples: int = 0
+    baseline: bool = True
+    prefill_batch_size: int = 4096
+    out: str = ""
+
+    def cli_cmd(self) -> None:
+        buckets = sorted({int(b) for b in self.buckets.split(",") if b.strip()})
+        multimodal = self.model_name in IS_MULTIMODAL
+
+        rows: list[EvalRow] = []
+        loaded_factor: int | None = None
+        model: ModelType | None = None
+        processor: ProcessorType | None = None
+
+        for bucket in buckets:
+            factor = _yarn_factor(bucket)
+            if factor != loaded_factor:
+                if model is not None:
+                    del model, processor
+                    torch.cuda.empty_cache()
+                model, processor = _load_model(self.model_name, bucket)
+                loaded_factor = factor
+            assert model is not None and processor is not None
+
+            for ex in load_niah_examples(
+                self.lang, bucket, self.limit_examples, multimodal
+            ):
+                rows.extend(self._eval_example(model, processor, ex))
+
+        self._report(rows)
+
+    def _eval_example(
+        self, model: ModelType, processor: ProcessorType, ex: EvalExample
+    ) -> list[EvalRow]:
+        enc, n = _encode_eval(processor, ex)
+
+        prefill = DynamicCache(config=model.config)
+        _do_prefill(_slice_inputs(enc, n), model, prefill, self.prefill_batch_size)
+
+        configs: list[tuple[str, Any]] = [
+            ("topk", TopKRetriever(n_retrieved=self.n_retrieved))
+        ]
+        if self.baseline:
+            configs.append(("full", FullContextRetriever()))
+
+        cache = RetrievalCache(
+            retriever=configs[0][1], prefill=prefill, config=model.config
+        )
+
+        gens: dict[str, str] = {}
+        for name, retriever in configs:
+            cache.retriever = retriever
+            gens[name] = _eval_generate(
+                model, processor, cache, n, enc, n, self.max_new_tokens
+            )
+            cache.reset()
+
+        del prefill, cache
+        torch.cuda.empty_cache()
+
+        ref = gens.get("full")
+        rows = []
+        for name, gen in gens.items():
+            row = score_row(
+                ex.bucket,
+                ex.idx,
+                name,
+                gen,
+                ex.label,
+                reference=ref if name != "full" else None,
+            )
+            rows.append(row)
+            console.print(
+                f"[dim]{ex.bucket} #{ex.idx} {name}:[/] "
+                f"contain={row.containment:.0f} f1={row.token_f1:.2f}"
+            )
+        return rows
+
+    def _report(self, rows: list[EvalRow]) -> None:
+        out_path = Path(
+            self.out or f"cache/eval/niah_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps([r.model_dump() for r in rows], indent=2, ensure_ascii=False)
+        )
+
+        table = Table(title="NIAH accuracy")
+        for col in ("bucket", "config", "n", "containment", "token_f1", "rouge_l"):
+            table.add_column(col)
+        seen: dict[tuple[int, str], list[EvalRow]] = {}
+        for r in rows:
+            seen.setdefault((r.bucket, r.config), []).append(r)
+        for (bucket, config), group in sorted(seen.items()):
+            n = len(group)
+
+            def mean(attr: str, group=group, n=n) -> float:
+                return sum(getattr(r, attr) for r in group) / n
+
+            table.add_row(
+                str(bucket),
+                config,
+                str(n),
+                f"{mean('containment'):.2f}",
+                f"{mean('token_f1'):.2f}",
+                f"{mean('rouge_l'):.2f}",
+            )
+        console.print(table)
+        console.print(f"wrote {out_path}")
+
+
 class CmdKvSearch(
     BaseModel,
     cli_shortcuts={
@@ -665,6 +856,7 @@ class CmdKvSearch(
     prefill: CliSubCommand[CmdPrefill]
     chat: CliSubCommand[CmdChat]
     analyze: CliSubCommand[CmdAnalyze]
+    eval: CliSubCommand[CmdEval]
 
     def cli_cmd(self) -> None:
         CliApp.run_subcommand(self)

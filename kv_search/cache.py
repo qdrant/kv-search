@@ -46,6 +46,9 @@ class AttentionPartition:
 
 
 class Retriever(Protocol):
+    @property
+    def type(self) -> str: ...
+
     def retrieve(
         self,
         query_states: torch.Tensor,
