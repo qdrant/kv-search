@@ -69,6 +69,13 @@ def recall_at_k(approx_ids: set[int], exact_ids: set[int]) -> float:
     return len(approx_ids & exact_ids) / len(exact_ids)
 
 
+class GenerationResult(BaseModel):
+    text: str
+    tokens: int
+    seconds: float
+    retrieval_seconds: float
+
+
 class EvalRow(BaseModel):
     bucket: int
     idx: int
@@ -80,26 +87,32 @@ class EvalRow(BaseModel):
     gen: str
     label: str
     agreement: float | None = None
+    gen_tokens: int = 0
+    gen_seconds: float = 0.0
+    retrieval_seconds: float = 0.0
 
 
 def score_row(
     bucket: int,
     idx: int,
     config: str,
-    gen: str,
+    gen: GenerationResult,
     label: str,
-    reference: str | None = None,
+    reference: GenerationResult | None = None,
 ) -> EvalRow:
     # agreement is token-F1 vs the reference (exact-search) generation
     return EvalRow(
         bucket=bucket,
         idx=idx,
         config=config,
-        containment=containment(gen, label),
-        token_f1=token_f1(gen, label),
-        rouge_l=rouge_l(gen, label),
-        gen_len=len(gen),
-        gen=gen,
+        containment=containment(gen.text, label),
+        token_f1=token_f1(gen.text, label),
+        rouge_l=rouge_l(gen.text, label),
+        gen_len=len(gen.text),
+        gen=gen.text,
         label=label,
-        agreement=None if reference is None else token_f1(gen, reference),
+        agreement=None if reference is None else token_f1(gen.text, reference.text),
+        gen_tokens=gen.tokens,
+        gen_seconds=gen.seconds,
+        retrieval_seconds=gen.retrieval_seconds,
     )

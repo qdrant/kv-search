@@ -242,6 +242,8 @@ class QdrantEdgeNativeRetriever(BaseModel):
     type: Literal["native"] = "native"
     n_retrieved: int = 128
     edge_root: str = "cache/edge"
+    exact: bool = True
+    hnsw_ef: int | None = None
 
     @cached_property
     def _engine(self) -> NativeEdgeRetriever:
@@ -270,6 +272,8 @@ class QdrantEdgeNativeRetriever(BaseModel):
                 query,
                 limit=self.n_retrieved,
                 scaling=scaling,
+                exact=self.exact,
+                hnsw_ef=self.hnsw_ef,
             )
         out = (
             torch.from_numpy(out)
@@ -288,6 +292,8 @@ class QdrantEdgeRetriever(BaseModel):
     type: Literal["edge"] = "edge"
     n_retrieved: int = 128
     edge_root: str = "cache/edge"
+    exact: bool = True
+    hnsw_ef: int | None = None
 
     _shards: dict[tuple[int, int], edge.EdgeShard] = PrivateAttr(default_factory=dict)
 
@@ -310,7 +316,9 @@ class QdrantEdgeRetriever(BaseModel):
                         query=query_states[query_idx + i, token_idx],
                         using="key",
                     ),
-                    params=edge.SearchParams(exact=True),
+                    params=edge.SearchParams(
+                        exact=self.exact, hnsw_ef=self.hnsw_ef
+                    ),
                     with_payload=False,
                     with_vector=["value"],
                     limit=self.n_retrieved,

@@ -8,6 +8,8 @@ class NativeEdgeRetriever:
         q: np.ndarray[tuple[int, int, int], np.dtype[np.float32]],
         limit: int,
         scaling: float,
+        exact: bool,
+        hnsw_ef: int | None,
     ) -> tuple[
         np.ndarray[tuple[int, int, int], np.dtype[np.float32]],
         np.ndarray[tuple[int, int], np.dtype[np.float32]],

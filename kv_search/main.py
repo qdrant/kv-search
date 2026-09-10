@@ -86,7 +86,7 @@ from kv_search.data import (
     load_dataset,
     load_niah_examples,
 )
-from kv_search.eval import EvalRow, score_row
+from kv_search.eval import EvalRow, GenerationResult, score_row
 from kv_search.timer import timers
 
 transformers.utils.logging.set_verbosity(transformers.utils.logging.CRITICAL)
@@ -249,7 +249,7 @@ def _do_prefill(
 
 
 def _upsert(
-    cache: RecordingCache,
+    cache: DynamicCache,
     url: str,
     batch_size: int = 1024,
     api_key: str | None = None,
@@ -292,7 +292,9 @@ def _upsert(
                         hnsw_config=HnswConfigDiff(m=0),
                     ),
                 },
-                optimizers_config=OptimizersConfigDiff(indexing_threshold=0),
+                optimizers_config=OptimizersConfigDiff(
+                    indexing_threshold=0, default_segment_number=1
+                ),
             )
 
             # convert on CPU so no f32 temp lands in GPU/unified memory
@@ -313,9 +315,16 @@ def _upsert(
                 vectors_config={
                     "key": VectorParamsDiff(hnsw_config=HnswConfigDiff(m=16))
                 },
-                optimizers_config=OptimizersConfigDiff(indexing_threshold=20000),
+                # threshold below the single segment's size so the graph builds
+                optimizers_config=OptimizersConfigDiff(
+                    indexing_threshold=1000, default_segment_number=1
+                ),
             )
             _wait_indexed(client, name)
+
+            indexed = client.get_collection(name).indexed_vectors_count
+            if not indexed:
+                raise RuntimeError(f"{name}: HNSW index not built ({indexed}/{n})")
 
             shard_dir = edge_root / f"layer{i:02d}_head{h}"
 
@@ -698,7 +707,7 @@ def _eval_generate(
     enc_full: BatchEncoding,
     n: int,
     max_new_tokens: int,
-) -> str:
+) -> GenerationResult:
     query_ids = enc_full["input_ids"][:, n:].to(model.device)
     q_len = query_ids.shape[1]
     gen_kwargs: dict[str, Any] = {
@@ -713,6 +722,10 @@ def _eval_generate(
             model.device
         )
 
+    # qdrant_retrieve is accumulated by the retriever; reset so we read this gen
+    timers.qdrant_retrieve.reset()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
     out = model.generate(  # ty:ignore[invalid-argument-type]
         **gen_kwargs,
         max_new_tokens=max_new_tokens,
@@ -720,7 +733,17 @@ def _eval_generate(
         use_cache=True,
         do_sample=False,
     )
-    return processor.tokenizer.decode(out[0, q_len:], skip_special_tokens=True)
+    torch.cuda.synchronize()
+    seconds = time.perf_counter() - t0
+
+    new = out[0, q_len:]
+    text = processor.tokenizer.decode(new, skip_special_tokens=True)
+    return GenerationResult(
+        text=text,
+        tokens=int(new.shape[0]),
+        seconds=seconds,
+        retrieval_seconds=timers.qdrant_retrieve.total,
+    )
 
 
 class CmdEval(BaseModel):
@@ -728,9 +751,17 @@ class CmdEval(BaseModel):
     lang: str = "english"
     buckets: str = "71680"
     n_retrieved: int = 128
+    hnsw_ef: int | None = None
     max_new_tokens: int = 128
     limit_examples: int = 0
-    baseline: bool = True
+    # which retrievers to score; exact/hnsw run on the same per-example edge shards
+    full: bool = True
+    exact: bool = True
+    hnsw: bool = True
+    topk: bool = False
+    url: str = "localhost"
+    api_key: str | None = None
+    upsert_batch_size: int = 1024
     prefill_batch_size: int = 4096
     out: str = ""
 
@@ -764,47 +795,63 @@ class CmdEval(BaseModel):
         self, model: ModelType, processor: ProcessorType, ex: EvalExample
     ) -> list[EvalRow]:
         enc, n = _encode_eval(processor, ex)
-
         prefill = DynamicCache(config=model.config)
         _do_prefill(_slice_inputs(enc, n), model, prefill, self.prefill_batch_size)
 
-        configs: list[tuple[str, Any]] = [
-            ("topk", TopKRetriever(n_retrieved=self.n_retrieved))
-        ]
-        if self.baseline:
-            configs.append(("full", FullContextRetriever()))
-
-        cache = RetrievalCache(
-            retriever=configs[0][1], prefill=prefill, config=model.config
+        edge_root = (
+            Path(tempfile.mkdtemp(prefix="eval_edge_", dir="cache"))
+            if self.exact or self.hnsw
+            else None
         )
-
-        gens: dict[str, str] = {}
-        for name, retriever in configs:
-            cache.retriever = retriever
-            gens[name] = _eval_generate(
-                model, processor, cache, n, enc, n, self.max_new_tokens
+        gens: dict[str, GenerationResult] = {}
+        try:
+            if edge_root is not None:
+                _upsert(prefill, self.url, self.upsert_batch_size,
+                        api_key=self.api_key, edge_root=edge_root)
+            cache = RetrievalCache(
+                retriever=FullContextRetriever(), prefill=prefill, config=model.config
             )
-            cache.reset()
 
-        del prefill, cache
-        torch.cuda.empty_cache()
+            def run(name: str, retriever: Any) -> None:
+                cache.retriever = retriever
+                gens[name] = _eval_generate(
+                    model, processor, cache, n, enc, n, self.max_new_tokens
+                )
+                cache.reset()
 
-        ref = gens.get("full")
+            if self.topk:
+                run("topk", TopKRetriever(n_retrieved=self.n_retrieved))
+            if self.full:
+                run("full", FullContextRetriever())
+            if edge_root is not None:
+                # one engine holds an exclusive WAL lock on the shards, so reuse
+                # it for exact and hnsw rather than opening a second
+                native = QdrantEdgeNativeRetriever(
+                    edge_root=str(edge_root), n_retrieved=self.n_retrieved
+                )
+                if self.exact:
+                    native.exact, native.hnsw_ef = True, None
+                    run("exact", native)
+                if self.hnsw:
+                    native.exact, native.hnsw_ef = False, self.hnsw_ef
+                    run("hnsw", native)
+        finally:
+            del prefill
+            torch.cuda.empty_cache()
+            if edge_root is not None:
+                shutil.rmtree(edge_root, ignore_errors=True)
+
+        # exact/topk scored vs full; hnsw vs exact (the graph-quality gap)
+        ref = {"topk": "full", "exact": "full", "hnsw": "exact"}
         rows = []
         for name, gen in gens.items():
-            row = score_row(
-                ex.bucket,
-                ex.idx,
-                name,
-                gen,
-                ex.label,
-                reference=ref if name != "full" else None,
-            )
+            row = score_row(ex.bucket, ex.idx, name, gen, ex.label,
+                            reference=gens.get(ref.get(name, "")))
             rows.append(row)
-            console.print(
-                f"[dim]{ex.bucket} #{ex.idx} {name}:[/] "
-                f"contain={row.containment:.0f} f1={row.token_f1:.2f}"
-            )
+            ms = 1e3 * row.gen_seconds / max(row.gen_tokens, 1)
+            console.print(f"[dim]{ex.bucket} #{ex.idx} {name}:[/] "
+                          f"contain={row.containment:.0f} f1={row.token_f1:.2f} "
+                          f"{ms:.0f}ms/tok")
         return rows
 
     def _report(self, rows: list[EvalRow]) -> None:
@@ -817,7 +864,9 @@ class CmdEval(BaseModel):
         )
 
         table = Table(title="NIAH accuracy")
-        for col in ("bucket", "config", "n", "containment", "token_f1", "rouge_l"):
+        cols = ("bucket", "config", "n", "containment", "token_f1", "rouge_l",
+                "ms/tok", "retr ms/tok")
+        for col in cols:
             table.add_column(col)
         seen: dict[tuple[int, str], list[EvalRow]] = {}
         for r in rows:
@@ -828,6 +877,10 @@ class CmdEval(BaseModel):
             def mean(attr: str, group=group, n=n) -> float:
                 return sum(getattr(r, attr) for r in group) / n
 
+            def per_tok(attr: str, group=group) -> float:
+                toks = sum(r.gen_tokens for r in group) or 1
+                return 1e3 * sum(getattr(r, attr) for r in group) / toks
+
             table.add_row(
                 str(bucket),
                 config,
@@ -835,6 +888,8 @@ class CmdEval(BaseModel):
                 f"{mean('containment'):.2f}",
                 f"{mean('token_f1'):.2f}",
                 f"{mean('rouge_l'):.2f}",
+                f"{per_tok('gen_seconds'):.0f}",
+                f"{per_tok('retrieval_seconds'):.0f}",
             )
         console.print(table)
         console.print(f"wrote {out_path}")

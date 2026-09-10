@@ -45,6 +45,8 @@ mod _native {
             q: PyReadonlyArray3<'_, f32>, // [16, q_len, 256]
             limit: usize,
             scaling: f32,
+            exact: bool,
+            hnsw_ef: Option<usize>,
         ) -> PyResult<(Bound<'py, PyArray3<f32>>, Bound<'py, PyArray2<f32>>)> {
             let arr = q.as_array();
             let q_heads = arr.shape()[0];
@@ -83,7 +85,7 @@ mod _native {
                                     score_threshold: None,
                                     limit: limit,
                                     offset: 0,
-                                    params: Some(SearchParams { exact: true, ..Default::default() }),
+                                    params: Some(SearchParams { exact, hnsw_ef, ..Default::default() }),
                                     with_vector: WithVector::Selector(vec!["value".to_string()]),
                                     with_payload: WithPayloadInterface::Bool(false),
                                 })
