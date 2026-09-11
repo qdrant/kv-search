@@ -83,8 +83,9 @@ from kv_search.cache import (
 from kv_search.data import (
     Datasets,
     EvalExample,
+    generate_niah_examples,
+    generate_qa_examples,
     load_dataset,
-    load_niah_examples,
 )
 from kv_search.eval import EvalRow, GenerationResult, score_row
 from kv_search.timer import timers
@@ -176,12 +177,12 @@ def _load_model(
         )
 
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
-    load_kwargs = dict(
-        config=config,
-        attn_implementation=_ATTN_IMPL,
-        dtype=torch.bfloat16,
-        device_map="cuda",
-    )
+    load_kwargs = {
+        "config": config,
+        "attn_implementation": _ATTN_IMPL,
+        "dtype": torch.bfloat16,
+        "device_map": "cuda",
+    }
     if model_name in IS_MULTIMODAL:
         model: ModelType = AutoModelForMultimodalLM.from_pretrained(
             model_name, **load_kwargs
@@ -506,9 +507,7 @@ class CmdChat(BaseModel):
         prefill, context_len = load_cache(cache_dir, model.config)
 
         # point edge/native retrievers at this tier's shard folder
-        if isinstance(
-            self.retriever, (QdrantEdgeRetriever, QdrantEdgeNativeRetriever)
-        ):
+        if isinstance(self.retriever, (QdrantEdgeRetriever, QdrantEdgeNativeRetriever)):
             self.retriever.edge_root = str(cache_dir / "edge")
 
         if self.record_indices and isinstance(self.retriever, TopKRetriever):
@@ -578,7 +577,9 @@ class CmdChat(BaseModel):
                             r.n_retrieved = n_retrieved
                         if isinstance(r, TopKRetriever):
                             r.record_indices = self.record_indices
-                        if isinstance(r, (QdrantEdgeRetriever, QdrantEdgeNativeRetriever)):
+                        if isinstance(
+                            r, (QdrantEdgeRetriever, QdrantEdgeNativeRetriever)
+                        ):
                             r.edge_root = str(cache_dir / "edge")
                         instances[cmd] = r
                     cache.retriever = instances[cmd]
@@ -682,7 +683,9 @@ def _encode_eval(
     ids = enc["input_ids"][0].tolist()
     im_start = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
     user_tok = processor.tokenizer.encode("user", add_special_tokens=False)[0]
-    starts = [i for i in range(len(ids) - 1) if ids[i] == im_start and ids[i + 1] == user_tok]
+    starts = [
+        i for i in range(len(ids) - 1) if ids[i] == im_start and ids[i + 1] == user_tok
+    ]
     if not starts:
         raise RuntimeError("could not locate final user turn in render")
     return enc, starts[-1]
@@ -748,12 +751,16 @@ def _eval_generate(
 
 class CmdEval(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
-    lang: str = "english"
+    task: Literal["niah", "qa"] = "qa"
     buckets: str = "71680"
     n_retrieved: int = 128
     hnsw_ef: int | None = None
     max_new_tokens: int = 128
-    limit_examples: int = 0
+    # task knobs (n_keys only used by niah)
+    n_keys: int = 1
+    depth: float = 0.5
+    seed: int = 0
+    n_examples: int = 5
     # which retrievers to score; exact/hnsw run on the same per-example edge shards
     full: bool = True
     exact: bool = True
@@ -784,9 +791,26 @@ class CmdEval(BaseModel):
                 loaded_factor = factor
             assert model is not None and processor is not None
 
-            for ex in load_niah_examples(
-                self.lang, bucket, self.limit_examples, multimodal
-            ):
+            if self.task == "niah":
+                examples = generate_niah_examples(
+                    processor.tokenizer,
+                    bucket,
+                    self.n_keys,
+                    self.depth,
+                    self.n_examples,
+                    self.seed,
+                    multimodal,
+                )
+            else:
+                examples = generate_qa_examples(
+                    processor.tokenizer,
+                    bucket,
+                    self.depth,
+                    self.n_examples,
+                    self.seed,
+                    multimodal,
+                )
+            for ex in examples:
                 rows.extend(self._eval_example(model, processor, ex))
 
         self._report(rows)
@@ -806,8 +830,13 @@ class CmdEval(BaseModel):
         gens: dict[str, GenerationResult] = {}
         try:
             if edge_root is not None:
-                _upsert(prefill, self.url, self.upsert_batch_size,
-                        api_key=self.api_key, edge_root=edge_root)
+                _upsert(
+                    prefill,
+                    self.url,
+                    self.upsert_batch_size,
+                    api_key=self.api_key,
+                    edge_root=edge_root,
+                )
             cache = RetrievalCache(
                 retriever=FullContextRetriever(), prefill=prefill, config=model.config
             )
@@ -845,13 +874,21 @@ class CmdEval(BaseModel):
         ref = {"topk": "full", "exact": "full", "hnsw": "exact"}
         rows = []
         for name, gen in gens.items():
-            row = score_row(ex.bucket, ex.idx, name, gen, ex.label,
-                            reference=gens.get(ref.get(name, "")))
+            row = score_row(
+                ex.bucket,
+                ex.idx,
+                name,
+                gen,
+                ex.label,
+                reference=gens.get(ref.get(name, "")),
+            )
             rows.append(row)
             ms = 1e3 * row.gen_seconds / max(row.gen_tokens, 1)
-            console.print(f"[dim]{ex.bucket} #{ex.idx} {name}:[/] "
-                          f"contain={row.containment:.0f} f1={row.token_f1:.2f} "
-                          f"{ms:.0f}ms/tok")
+            console.print(
+                f"[dim]{ex.bucket} #{ex.idx} {name}:[/] "
+                f"contain={row.containment:.0f} f1={row.token_f1:.2f} "
+                f"{ms:.0f}ms/tok"
+            )
         return rows
 
     def _report(self, rows: list[EvalRow]) -> None:
@@ -864,8 +901,16 @@ class CmdEval(BaseModel):
         )
 
         table = Table(title="NIAH accuracy")
-        cols = ("bucket", "config", "n", "containment", "token_f1", "rouge_l",
-                "ms/tok", "retr ms/tok")
+        cols = (
+            "bucket",
+            "config",
+            "n",
+            "containment",
+            "token_f1",
+            "rouge_l",
+            "ms/tok",
+            "retr ms/tok",
+        )
         for col in cols:
             table.add_column(col)
         seen: dict[tuple[int, str], list[EvalRow]] = {}
