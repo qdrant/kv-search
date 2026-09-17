@@ -1,6 +1,7 @@
 import compression.zstd
 import json
 import math
+import subprocess
 import types
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -176,10 +177,23 @@ class TopKRetriever(BaseModel):
             scores = torch.cat(self._scores[layer_idx], dim=1)
             max_len = max(x.shape[-1] for x in self._dynamic_scores[layer_idx])
             for i, t in enumerate(self._dynamic_scores[layer_idx]):
-                self._dynamic_scores[layer_idx][i] = torch.cat([t, torch.full((t.shape[0], t.shape[1], max_len - t.shape[2]), torch.nan)], dim=2)
+                self._dynamic_scores[layer_idx][i] = torch.cat(
+                    [
+                        t,
+                        torch.full(
+                            (t.shape[0], t.shape[1], max_len - t.shape[2]), torch.nan
+                        ),
+                    ],
+                    dim=2,
+                )
             dynamic_scores = torch.cat(self._dynamic_scores[layer_idx], dim=1)
             save_file(
-                    {"indices": indices, "scores": scores, "dynamic_scores": dynamic_scores}, str(path / f"indices_{layer_idx:02d}.safetensors")
+                {
+                    "indices": indices,
+                    "scores": scores,
+                    "dynamic_scores": dynamic_scores,
+                },
+                str(path / f"indices_{layer_idx:02d}.safetensors"),
             )
 
 
@@ -388,7 +402,9 @@ class QdrantEdgeRetriever(BaseModel):
         key = (layer_idx, head_idx)
         if key in self._shards:
             return self._shards[key]
-        shard = edge.EdgeShard.load(f"{self.edge_root}/layer{layer_idx:02d}_head{head_idx}")
+        shard = edge.EdgeShard.load(
+            f"{self.edge_root}/layer{layer_idx:02d}_head{head_idx}"
+        )
         self._shards[key] = shard
         return shard
 
@@ -482,6 +498,7 @@ class RetrievalCache(DynamicCache):
         config: PreTrainedConfig | None = None,
         tailm: "TailmRuntime | None" = None,
         check: "TailmCheck | None" = None,
+        recorder: SessionRecorder | None = None,
     ):
         super().__init__(config=config)
         self.retriever = retriever
@@ -490,6 +507,7 @@ class RetrievalCache(DynamicCache):
         self.tailm = tailm
         # --tailm-check readout; observes only forwards where the tail step ran
         self.check = check
+        self.recorder = recorder
         self._restore_state()
 
     def _restore_state(self):
@@ -613,6 +631,13 @@ class RetrievalCache(DynamicCache):
         query_states: torch.Tensor | None = None,
         **kwargs,
     ):
+        if (
+            self.recorder is not None
+            and query_states is not None
+            and isinstance(self.retriever, FullContextRetriever)
+        ):
+            self.recorder.record_query(layer_idx, query_states)
+
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
         )
@@ -704,6 +729,83 @@ class RecordingCache(DynamicCache):
         self._shapes.clear()
 
 
+class SessionRecorder:
+    def __init__(self, out_dir: Path, meta: dict[str, str]):
+        self.out_dir = out_dir
+        self.meta = meta
+        self._chunks: dict[str, list[torch.Tensor]] = {}
+        self._layers: set[int] = set()
+        self._scaling: float | None = None
+
+    def _append(self, name: str, t: torch.Tensor) -> None:
+        self._chunks.setdefault(name, []).append(
+            t.to("cpu", torch.float32).contiguous()
+        )
+
+    def record_query(self, layer_idx: int, query_states: torch.Tensor) -> None:
+        self._layers.add(layer_idx)
+        # [1, heads, q, d] -> [q, heads, d], so rows are token positions
+        self._append(f"layer{layer_idx:02d}/queries", query_states[0].transpose(0, 1))
+
+    def record_attn_out(
+        self, layer_idx: int, attn_output: torch.Tensor, scaling: float
+    ) -> None:
+        # attn_output is pre-reshape [1, q, heads, d], already token-major
+        self._append(f"layer{layer_idx:02d}/attn_out", attn_output[0])
+        self._scaling = scaling
+
+    def reset(self) -> None:
+        self._chunks.clear()
+        self._layers.clear()
+
+    @property
+    def n_rows(self) -> int:
+        chunks = next(iter(self._chunks.values()), [])
+        return sum(t.shape[0] for t in chunks)
+
+    def save(
+        self,
+        cache: RetrievalCache,
+        prompt_idx: int,
+        token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        prompt_len: int,
+        prompt: str,
+        answer: str,
+    ) -> Path:
+        tensors = {name: torch.cat(cs, dim=0) for name, cs in self._chunks.items()}
+
+        for layer_idx in sorted(self._layers):
+            layer = cache.layers[layer_idx]
+            assert isinstance(layer, CacheLayerMixin)
+            assert layer.keys is not None and layer.values is not None
+            p = f"layer{layer_idx:02d}"
+            tensors[f"{p}/keys"] = (
+                layer.keys[0].transpose(0, 1).to("cpu", torch.float32).contiguous()
+            )
+            tensors[f"{p}/values"] = (
+                layer.values[0].transpose(0, 1).to("cpu", torch.float32).contiguous()
+            )
+
+        tensors["positions"] = positions.to("cpu", torch.int64).contiguous()
+        tensors["token_ids"] = token_ids.to("cpu", torch.int64).contiguous()
+        tensors["prompt_len"] = torch.tensor([prompt_len], dtype=torch.int64)
+
+        meta = {
+            **self.meta,
+            "scaling": str(self._scaling),
+            "layers": ",".join(str(i) for i in sorted(self._layers)),
+            "prompt": prompt,
+            "answer": answer,
+        }
+
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        path = self.out_dir / f"replay_{prompt_idx:02d}.safetensors"
+        save_file(tensors, str(path), metadata=meta)
+        self.reset()
+        return path
+
+
 def _layer_to_dict(
     layer: CacheLayerMixin | LinearAttentionCacheLayerMixin,
 ) -> dict[str, torch.Tensor]:
@@ -763,13 +865,24 @@ def _read_layer(file: Path) -> dict:
     return load(blob)
 
 
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except subprocess.SubprocessError, OSError:
+        return "unknown"
+
+
 @timers.prefill_save
 def save_cache(
     cache: Cache,
     path: Path,
     context_len: int,
 ) -> None:
-    (path / "meta.json").write_text(json.dumps({"context_len": context_len}))
+    (path / "meta.json").write_text(
+        json.dumps({"context_len": context_len, "kv_search_commit": _git_commit()})
+    )
     for i, layer in track(
         enumerate(cache.layers), description="Writing to disk", total=len(cache.layers)
     ):
@@ -866,7 +979,9 @@ def _partition_attend(
     lse = torch.logsumexp(attn_weights, dim=-1)
     out = torch.matmul(torch.softmax(attn_weights, dim=-1), value_states)
 
-    return AttentionPartition(out=out, lse=lse, weights=attn_weights if return_weights else None)
+    return AttentionPartition(
+        out=out, lse=lse, weights=attn_weights if return_weights else None
+    )
 
 
 def _merge_partitions(
@@ -954,6 +1069,11 @@ def _qwen_3_5_forward(
             scaling=self.scaling,
             **kwargs,
         )
+
+        if is_full_context and past_key_values.recorder is not None:
+            past_key_values.recorder.record_attn_out(
+                self.layer_idx, attn_output, self.scaling
+            )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)
