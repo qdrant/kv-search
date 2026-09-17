@@ -80,7 +80,9 @@ from kv_search.cache import (
     RecordingCache,
     RetrievalCache,
     RetrieverConfig,
+    SessionRecorder,
     TopKRetriever,
+    _git_commit,
     bind_query_aware_cache,
     load_cache,
     save_cache,
@@ -929,6 +931,7 @@ class CmdChat(TailmFlags, ProjDir):
     max_new_tokens: int = 256
     render_live: bool = True
     record_indices: bool = False
+    record_prompts: bool = False
 
     def cli_cmd(self) -> None:
         self.tailm_preflight(self.model_name, self.retriever.type)
@@ -981,12 +984,33 @@ class CmdChat(TailmFlags, ProjDir):
                 retriever_type=self.retriever.type,
             )
             self.tailm_attach(self.retriever, tailm)
+
+        recorder: SessionRecorder | None = None
+        if self.record_prompts:
+            recorder = SessionRecorder(
+                cache_dir / "replay",
+                meta={
+                    "model": self.model_name,
+                    "dataset": str(self.dataset_name),
+                    "qdrant_size": self.qdrant_size,
+                    "context_len": str(context_len),
+                    "attn_implementation": model.config._attn_implementation,
+                    "kv_search_commit": _git_commit(),
+                },
+            )
+            if not isinstance(self.retriever, FullContextRetriever):
+                console.print(
+                    "[yellow]record_prompts only records under `-r full`; "
+                    "switch with /full in the repl[/]"
+                )
+
         cache = RetrievalCache(
             retriever=self.retriever,
             prefill=prefill,
             config=model.config,
             tailm=tailm,
             check=check,
+            recorder=recorder,
         )
 
         streamer = TimedStreamer(processor.tokenizer, skip_prompt=True)
@@ -1071,11 +1095,17 @@ class CmdChat(TailmFlags, ProjDir):
             if record:
                 cache.retriever.reset_indices()
 
+            record_prompt = cache.recorder is not None and isinstance(
+                cache.retriever, FullContextRetriever
+            )
+            if record_prompt:
+                cache.recorder.reset()
+
             # isolate this prompt's timings; discard the first (cold) prompt when measuring
             timers.reset_generation()
             torch.cuda.reset_peak_memory_stats()
             try:
-                prompt_len = self._generate(
+                prompt_len, out = self._generate(
                     model, processor, cache, context_len, streamer, user
                 )
                 if record:
@@ -1086,6 +1116,23 @@ class CmdChat(TailmFlags, ProjDir):
                         json.dumps({"prompt_len": prompt_len})
                     )
                     cache.retriever.save_indices(tmp)
+                if record_prompt:
+                    n_rows = cache.recorder.n_rows
+                    token_ids = out[0, :n_rows]
+                    positions = context_len + torch.arange(n_rows)
+                    answer = processor.tokenizer.decode(
+                        out[0, prompt_len:], skip_special_tokens=True
+                    )
+                    path = cache.recorder.save(
+                        cache,
+                        prompt_idx,
+                        token_ids,
+                        positions,
+                        prompt_len,
+                        user,
+                        answer,
+                    )
+                    console.print(f"[green]recorded {n_rows} positions -> {path}[/]")
                 prompt_idx += 1
             except KeyboardInterrupt:
                 streamer.end()
@@ -1105,7 +1152,7 @@ class CmdChat(TailmFlags, ProjDir):
         context_len: int,
         streamer: TimedStreamer,
         user: str,
-    ) -> int:
+    ) -> tuple[int, torch.Tensor]:
         inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
             add_generation_prompt=True,
@@ -1122,15 +1169,16 @@ class CmdChat(TailmFlags, ProjDir):
             context_len, context_len + prompt_len, device=model.device
         ).unsqueeze(0)
 
-        model.generate(
+        out: torch.Tensor = model.generate(  # ty:ignore[invalid-assignment]
             **inputs,  # ty:ignore[invalid-argument-type]
             max_new_tokens=self.max_new_tokens,
             past_key_values=cache,
             use_cache=True,
             streamer=streamer,
+            do_sample=False,
         )  # ty:ignore[invalid-argument-type]
 
-        return prompt_len
+        return prompt_len, out
 
 
 class CmdAnalyze(BaseModel):
@@ -1264,7 +1312,11 @@ def _evict(root: Path, keep: int) -> None:
 
 
 def _cached_dir(
-    root: Path, key: str, keep: int, build: Callable[[Path], None], rebuild: bool = False
+    root: Path,
+    key: str,
+    keep: int,
+    build: Callable[[Path], None],
+    rebuild: bool = False,
 ) -> Path:
     """Return root/key, running build(tmp) into a temp dir on a miss and
     publishing it atomically. Keeps the `keep` most-recent entries."""
@@ -1362,8 +1414,13 @@ class CmdEval(BaseModel):
     ) -> DynamicCache:
         """Prefill the context KV, cached to disk and reused across runs."""
         key = _cache_key(
-            self.model_name, self.task, ex.bucket, self.seed, ex.idx,
-            self.n_keys, self.depth,
+            self.model_name,
+            self.task,
+            ex.bucket,
+            self.seed,
+            ex.idx,
+            self.n_keys,
+            self.depth,
         )
 
         def build(tmp: Path) -> None:
@@ -1383,14 +1440,25 @@ class CmdEval(BaseModel):
         edge_root: Path | None = None
         if self.exact or self.hnsw:
             key = _cache_key(
-                self.model_name, self.task, ex.bucket, self.seed, ex.idx,
-                self.n_keys, self.depth, self.hnsw_segments, self.vectors_on_disk,
+                self.model_name,
+                self.task,
+                ex.bucket,
+                self.seed,
+                ex.idx,
+                self.n_keys,
+                self.depth,
+                self.hnsw_segments,
+                self.vectors_on_disk,
             )
 
             def build(tmp: Path, prefill: DynamicCache = prefill) -> None:
                 _upsert(
-                    prefill, self.url, self.upsert_batch_size,
-                    api_key=self.api_key, edge_root=tmp, segments=self.hnsw_segments,
+                    prefill,
+                    self.url,
+                    self.upsert_batch_size,
+                    api_key=self.api_key,
+                    edge_root=tmp,
+                    segments=self.hnsw_segments,
                     vectors_on_disk=self.vectors_on_disk,
                 )
 
