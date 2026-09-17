@@ -2,6 +2,8 @@ use pyo3::prelude::*;
 
 #[pymodule]
 mod _native {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
     use std::{collections::HashMap, path::Path};
 
     use numpy::{PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray3, ndarray::s};
@@ -25,7 +27,6 @@ mod _native {
             let shards = shards
                 .into_iter()
                 .map(|(k, p)| {
-                    // somewhat empirical, also might need to go back to sequential for hnsw
                     let v = EdgeShard::load(
                         Path::new(&p),
                         Some(EdgeConfigBuilder::new().max_search_threads(8).build()),
@@ -66,10 +67,14 @@ mod _native {
                 })
                 .collect();
 
-            // per query head and query token
+            // per query head and query token; timers split search vs merge (temporary)
+            let search_ns = AtomicU64::new(0);
+            let merge_ns = AtomicU64::new(0);
+            let wall = Instant::now();
             let results: Vec<Vec<(Vec<f32>, f32)>> = queries
                 .into_par_iter()
                 .map(|(h, qvs)| {
+                    let t_search = Instant::now();
                     let batch = self.shards[&(layer_idx, h)]
                         .query_batch(
                             qvs.into_iter()
@@ -92,13 +97,15 @@ mod _native {
                                 .collect(),
                         )
                         .map_err(|e| e.to_string())?;
+                    search_ns.fetch_add(t_search.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                     // logit_i = score_i * scaling
                     // m = max(logit_i for all i)
                     // w_i = exp(logit_i - m)
                     // lse = m + ln(sum(w_i))
                     // out = sum(w_i * v_i) / sum(w_i)
-                    batch
+                    let t_merge = Instant::now();
+                    let merged = batch
                         .into_iter()
                         .map(|points| {
                             let m = points
@@ -131,10 +138,20 @@ mod _native {
                             }
                             Ok((out, m + sum.ln()))
                         })
-                        .collect::<Result<Vec<_>, String>>()
+                        .collect::<Result<Vec<_>, String>>();
+                    merge_ns.fetch_add(t_merge.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    merged
                 })
                 .collect::<Result<Vec<_>, String>>()
                 .map_err(|e| PyRuntimeError::new_err(e))?;
+            eprintln!(
+                "[native] layer={} q_len={} wall_ms={:.1} search_ms={:.1} merge_ms={:.1}",
+                layer_idx,
+                q_len,
+                wall.elapsed().as_nanos() as f64 / 1e6,
+                search_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                merge_ns.load(Ordering::Relaxed) as f64 / 1e6,
+            );
 
             let value_dim = results.iter().flatten().map(|(o, _)| o.len()).max().unwrap_or(0);
             let mut out_flat: Vec<f32> = Vec::with_capacity(q_heads * q_len * value_dim);

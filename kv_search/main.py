@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import math
@@ -30,6 +31,7 @@ os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import importlib.util
+from collections.abc import Callable
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Literal
@@ -256,6 +258,8 @@ def _upsert(
     api_key: str | None = None,
     edge_root: Path = Path("cache/edge"),
     parallel: int = 4,
+    segments: int = 1,
+    vectors_on_disk: bool = True,
 ):
     edge_root.mkdir(parents=True, exist_ok=True)
     client = QdrantClient(url, api_key=api_key, prefer_grpc=True)
@@ -283,18 +287,18 @@ def _upsert(
                     "key": VectorParams(
                         size=d,
                         distance=Distance.DOT,
-                        on_disk=True,
-                        hnsw_config=HnswConfigDiff(m=0, on_disk=True),
+                        on_disk=vectors_on_disk,
+                        hnsw_config=HnswConfigDiff(m=0, on_disk=vectors_on_disk),
                     ),
                     "value": VectorParams(
                         size=d,
                         distance=Distance.DOT,
-                        on_disk=True,
+                        on_disk=vectors_on_disk,
                         hnsw_config=HnswConfigDiff(m=0),
                     ),
                 },
                 optimizers_config=OptimizersConfigDiff(
-                    indexing_threshold=0, default_segment_number=1
+                    indexing_threshold=0, default_segment_number=segments
                 ),
             )
 
@@ -314,11 +318,13 @@ def _upsert(
             client.update_collection(
                 collection_name=name,
                 vectors_config={
-                    "key": VectorParamsDiff(hnsw_config=HnswConfigDiff(m=16))
+                    "key": VectorParamsDiff(
+                        hnsw_config=HnswConfigDiff(m=16, on_disk=vectors_on_disk)
+                    )
                 },
                 # threshold below the single segment's size so the graph builds
                 optimizers_config=OptimizersConfigDiff(
-                    indexing_threshold=1000, default_segment_number=1
+                    indexing_threshold=1000, default_segment_number=segments
                 ),
             )
             _wait_indexed(client, name)
@@ -725,6 +731,18 @@ def _eval_generate(
             model.device
         )
 
+    # warm-up (untimed): absorbs one-time costs - edge shard load/populate, cuda
+    # kernel init, page cache - so the timed run is steady-state and full vs hnsw
+    # compare fairly (full's KV is already resident from prefill).
+    model.generate(  # ty:ignore[invalid-argument-type]
+        **gen_kwargs,
+        max_new_tokens=min(max_new_tokens, 2),
+        past_key_values=cache,
+        use_cache=True,
+        do_sample=False,
+    )
+    cache.reset()
+
     # qdrant_retrieve is accumulated by the retriever; reset so we read this gen
     timers.qdrant_retrieve.reset()
     torch.cuda.synchronize()
@@ -749,12 +767,52 @@ def _eval_generate(
     )
 
 
+# prefill KV is keyed by context only (no segments), so it survives a segment
+# sweep; edge shards depend on segments and get their own cache
+_PREFILL_CACHE = Path("cache/eval_prefill")
+_SHARD_CACHE = Path("cache/eval_shards")
+
+
+def _cache_key(*parts: object) -> str:
+    return hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()[:16]
+
+
+def _evict(root: Path, keep: int) -> None:
+    """Drop all but the `keep` most-recently-used entries under root."""
+    dirs = sorted(
+        (p for p in root.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+    )
+    for d in dirs[: max(0, len(dirs) - keep)]:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _cached_dir(
+    root: Path, key: str, keep: int, build: Callable[[Path], None], rebuild: bool = False
+) -> Path:
+    """Return root/key, running build(tmp) into a temp dir on a miss and
+    publishing it atomically. Keeps the `keep` most-recent entries."""
+    d = root / key
+    if rebuild:
+        shutil.rmtree(d, ignore_errors=True)
+    if d.exists():
+        os.utime(d, None)  # mark recently used
+        return d
+    root.mkdir(parents=True, exist_ok=True)
+    _evict(root, keep - 1)
+    tmp = Path(tempfile.mkdtemp(dir=root))
+    build(tmp)
+    os.replace(tmp, d)
+    return d
+
+
 class CmdEval(BaseModel):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     task: Literal["niah", "qa"] = "qa"
     buckets: str = "71680"
     n_retrieved: int = 128
     hnsw_ef: int | None = None
+    hnsw_segments: int = 1
     max_new_tokens: int = 128
     # task knobs (n_keys only used by niah)
     n_keys: int = 1
@@ -769,6 +827,14 @@ class CmdEval(BaseModel):
     url: str = "localhost"
     api_key: str | None = None
     upsert_batch_size: int = 1024
+    # build-time memory tier: True = on disk (Cold, paged on demand), False = in
+    # RAM / Cached (edge pre-loads into page cache on open). Persisted in the shard.
+    vectors_on_disk: bool = True
+    # cache prefills + shards across runs; keep the N most-recent per cache.
+    # rebuild_shards forces re-upsert (edge build constants aren't in the key);
+    # prefill is fully keyed, so clear cache/eval_prefill by hand if code changes
+    cache_max: int = 6
+    rebuild_shards: bool = False
     prefill_batch_size: int = 4096
     out: str = ""
 
@@ -815,28 +881,49 @@ class CmdEval(BaseModel):
 
         self._report(rows)
 
+    def _cached_prefill(
+        self, model: ModelType, enc: Any, n: int, ex: EvalExample
+    ) -> DynamicCache:
+        """Prefill the context KV, cached to disk and reused across runs."""
+        key = _cache_key(
+            self.model_name, self.task, ex.bucket, self.seed, ex.idx,
+            self.n_keys, self.depth,
+        )
+
+        def build(tmp: Path) -> None:
+            prefill = DynamicCache(config=model.config)
+            _do_prefill(_slice_inputs(enc, n), model, prefill, self.prefill_batch_size)
+            save_cache(prefill, tmp, n)
+
+        pdir = _cached_dir(_PREFILL_CACHE, key, self.cache_max, build)
+        return load_cache(pdir, model.config)[0]
+
     def _eval_example(
         self, model: ModelType, processor: ProcessorType, ex: EvalExample
     ) -> list[EvalRow]:
         enc, n = _encode_eval(processor, ex)
-        prefill = DynamicCache(config=model.config)
-        _do_prefill(_slice_inputs(enc, n), model, prefill, self.prefill_batch_size)
+        prefill = self._cached_prefill(model, enc, n, ex)
 
-        edge_root = (
-            Path(tempfile.mkdtemp(prefix="eval_edge_", dir="cache"))
-            if self.exact or self.hnsw
-            else None
-        )
+        edge_root: Path | None = None
+        if self.exact or self.hnsw:
+            key = _cache_key(
+                self.model_name, self.task, ex.bucket, self.seed, ex.idx,
+                self.n_keys, self.depth, self.hnsw_segments, self.vectors_on_disk,
+            )
+
+            def build(tmp: Path, prefill: DynamicCache = prefill) -> None:
+                _upsert(
+                    prefill, self.url, self.upsert_batch_size,
+                    api_key=self.api_key, edge_root=tmp, segments=self.hnsw_segments,
+                    vectors_on_disk=self.vectors_on_disk,
+                )
+
+            edge_root = _cached_dir(
+                _SHARD_CACHE, key, self.cache_max, build, self.rebuild_shards
+            )
+
         gens: dict[str, GenerationResult] = {}
         try:
-            if edge_root is not None:
-                _upsert(
-                    prefill,
-                    self.url,
-                    self.upsert_batch_size,
-                    api_key=self.api_key,
-                    edge_root=edge_root,
-                )
             cache = RetrievalCache(
                 retriever=FullContextRetriever(), prefill=prefill, config=model.config
             )
@@ -853,6 +940,14 @@ class CmdEval(BaseModel):
             if self.full:
                 run("full", FullContextRetriever())
             if edge_root is not None:
+                # full/topk are done; exact/hnsw read the shards, not the prefill
+                # KV, so free it here — lets the mmap'd shards fit in page cache
+                # and avoids disk thrash at long context
+                for layer in prefill.layers:
+                    if isinstance(layer, CacheLayerMixin):
+                        layer.keys = None
+                        layer.values = None
+                torch.cuda.empty_cache()
                 # one engine holds an exclusive WAL lock on the shards, so reuse
                 # it for exact and hnsw rather than opening a second
                 native = QdrantEdgeNativeRetriever(
@@ -867,8 +962,6 @@ class CmdEval(BaseModel):
         finally:
             del prefill
             torch.cuda.empty_cache()
-            if edge_root is not None:
-                shutil.rmtree(edge_root, ignore_errors=True)
 
         # exact/topk scored vs full; hnsw vs exact (the graph-quality gap)
         ref = {"topk": "full", "exact": "full", "hnsw": "exact"}
