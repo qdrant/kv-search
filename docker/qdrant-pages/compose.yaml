@@ -1,0 +1,16 @@
+services:
+  qdrant:
+    image: ${QDRANT_PAGES_IMAGE:-qdrant-pages:demo}
+    ports:
+      - "127.0.0.1:${QDRANT_HTTP_PORT:-6433}:6333"
+      - "127.0.0.1:${QDRANT_GRPC_PORT:-6434}:6334"
+    environment:
+      RAYON_NUM_THREADS: ${QDRANT_THREADS:-12}
+      QDRANT__STORAGE__PERFORMANCE__MAX_SEARCH_THREADS: ${QDRANT_THREADS:-12}
+    volumes:
+      - qdrant-pages-storage:/qdrant/storage
+      - qdrant-pages-snapshots:/qdrant/snapshots
+    restart: unless-stopped
+volumes:
+  qdrant-pages-storage:
+  qdrant-pages-snapshots:

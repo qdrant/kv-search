@@ -71,6 +71,7 @@ from kv_search.cache import (
     QdrantEdgeNativeRetriever,
     QdrantEdgeRetriever,
     QdrantRetriever,
+    QdrantPagesRetriever,
     RecordingCache,
     RetrievalCache,
     RetrieverConfig,
@@ -462,6 +463,7 @@ _RETRIEVERS: dict[str, type[RetrieverConfig]] = {
     "topk": TopKRetriever,
     "full": FullContextRetriever,
     "qdrant": QdrantRetriever,
+    "qdrant-pages": QdrantPagesRetriever,
     "edge": QdrantEdgeRetriever,
     "native": QdrantEdgeNativeRetriever,
 }
@@ -477,6 +479,8 @@ class CmdChat(BaseModel):
     record_indices: bool = False
 
     def cli_cmd(self) -> None:
+        if isinstance(self.retriever, QdrantPagesRetriever) and self.model_name != "Qwen/Qwen3.5-9B":
+            raise ValueError("The qdrant-pages chat integration currently supports Qwen/Qwen3.5-9B")
         context_tokens = (
             _size_to_tokens(self.qdrant_size)
             if self.dataset_name == Datasets.QDRANT
@@ -556,6 +560,9 @@ class CmdChat(BaseModel):
                     self.render_live = not self.render_live
                     print(f"[render_live = {self.render_live}]")
                 elif cmd in _RETRIEVERS:
+                    if cmd == "qdrant-pages" and self.model_name != "Qwen/Qwen3.5-9B":
+                        print("qdrant-pages currently supports Qwen/Qwen3.5-9B")
+                        continue
                     if cmd not in instances:
                         r = _RETRIEVERS[cmd]()
                         if hasattr(r, "n_retrieved"):

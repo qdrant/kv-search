@@ -235,6 +235,50 @@ class QdrantRetriever(BaseModel):
         return AttentionPartition(out=out, lse=lse)
 
 
+class QdrantPagesRetriever(BaseModel):
+    """Whole-context attention from the custom immutable Qdrant page index."""
+
+    type: Literal["qdrant-pages"] = "qdrant-pages"
+    url: str = "http://localhost:6433"
+    grpc_port: int = 6434
+    api_key: str | None = None
+    collection: str = "pages_100k"
+    ef: int = Field(default=16, gt=0)
+    rescore: bool = False
+    batch_size: int = Field(default=64, gt=0)
+
+    @cached_property
+    def _client(self):
+        from kv_search.qdrant_pages import PageAttentionClient
+
+        return PageAttentionClient(self.url, self.grpc_port, self.collection, self.api_key)
+
+    def retrieve(self, query_states, layer_idx, prefill, scaling) -> AttentionPartition:
+        if query_states.ndim != 4 or query_states.shape[0] != 1:
+            raise ValueError("qdrant-pages supports batch size 1")
+        # Qwen3.5 interleaves linear-state layers and dense KV layers. Persisted
+        # vector names use dense-layer ordinals, not transformer layer numbers.
+        layers = [i for i, layer in enumerate(prefill.layers)
+                  if isinstance(layer, CacheLayerMixin) and layer.keys is not None]
+        if layer_idx not in layers:
+            raise ValueError("Requested layer has no cached K/V tensors")
+        layer = prefill.layers[layer_idx]
+        kv_heads, context_len, dim = layer.keys.shape[1:]
+        ordinal = layers.index(layer_idx)
+        if query_states.shape[-1] != dim:
+            raise ValueError("Query dimension does not match the cached context")
+        self._client.validate(ordinal, kv_heads, dim, context_len, rescore=self.rescore)
+        query = query_states[0].detach().to(device="cpu", dtype=torch.float32).numpy()
+        with timers.qdrant_retrieve:
+            out, lse = self._client.query(query, ordinal, kv_heads, ef=self.ef,
+                                         rescore=self.rescore, scaling=scaling,
+                                         batch_size=self.batch_size)
+        return AttentionPartition(
+            out=torch.from_numpy(out).unsqueeze(0).to(query_states.device, query_states.dtype),
+            lse=torch.from_numpy(lse).unsqueeze(0).to(query_states.device),
+        )
+
+
 class QdrantEdgeNativeRetriever(BaseModel):
     type: Literal["native"] = "native"
     n_retrieved: int = 128
@@ -369,6 +413,7 @@ RetrieverConfig = Annotated[
     TopKRetriever
     | FullContextRetriever
     | QdrantRetriever
+    | QdrantPagesRetriever
     | QdrantEdgeRetriever
     | QdrantEdgeNativeRetriever,
     Field(discriminator="type"),

@@ -82,3 +82,8 @@ docs/_build/
 
 # Pyenv
 .python-version
+
+# Local demo images, snapshots, and leftovers from the prototype branch
+/artifacts/
+/store/target/
+.venv-smoke/

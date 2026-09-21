@@ -42,7 +42,7 @@ Interactive generation against the prefilled cache:
 uv run kv-search chat -r native -g 512
 ```
 
-- `-r` retriever: `native`, `edge`, `qdrant`, `topk`, `full`
+- `-r` retriever: `native`, `edge`, `qdrant`, `qdrant-pages`, `topk`, `full`
 - `-g` max new tokens, `-n` top-k retrieved per step
 - `--record-indices` saves per-prompt retrieval indices/scores for `analyze`, only works with `-r topk`
 
@@ -67,3 +67,19 @@ uv run kv-search analyze
 ```
 
 Writes plots into the cache directory.
+
+## Custom Qdrant page-attention demo
+
+`-r qdrant-pages` uses our Qdrant build to return attention output and LSE directly.
+The other retrievers keep their existing behavior. See
+[the Docker build, test-data setup, and colleague quickstart](docs/qdrant-pages-demo.md).
+
+```sh
+docker compose -f docker/qdrant-pages/compose.yaml up -d
+# Restore the prepared collection first (instructions in the quickstart).
+uv run kv-search chat -r qdrant-pages --retriever.collection pages_100k \
+  --retriever.ef 16 -d qdrant -s 100k -g 128
+```
+
+The Qdrant server and cached-query tests run on CPU. Full-model chat still needs
+a suitable GPU environment and the matching Qwen3.5-9B prefill cache.
