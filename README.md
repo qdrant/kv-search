@@ -76,7 +76,7 @@ The other retrievers keep their existing behavior. See
 
 ```sh
 docker compose -f docker/qdrant-pages/compose.yaml up -d
-# Restore the prepared collection first (instructions in the quickstart).
+# Build/ingest the prefill cache or restore a snapshot first (see the quickstart).
 uv run kv-search chat -r qdrant-pages --retriever.collection pages_100k \
   --retriever.ef 16 -d qdrant -s 100k -g 128
 ```

@@ -1,9 +1,8 @@
-"""Transport for the experimental Qdrant page-attention score channel."""
+"""Client for the experimental typed Qdrant attention REST API."""
 import math
 
 import numpy as np
 import requests
-from qdrant_client import QdrantClient, grpc
 
 
 class PageAttentionClient:
@@ -13,12 +12,13 @@ class PageAttentionClient:
         self.collection = collection
         self.timeout = timeout
         self.headers = {"api-key": api_key} if api_key else {}
-        self.client = QdrantClient(url, grpc_port=grpc_port, api_key=api_key,
-                                  prefer_grpc=True, timeout=timeout)
+        # grpc_port remains accepted for compatibility with retriever settings.
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
         self._validated = set()
 
     def validate(self, layer, kv_heads, dim, context_len, *, rescore=False):
-        """Fail before treating an ordinary point result as attention coordinates."""
+        """Validate the immutable collection against the model's cached context."""
         key = (layer, kv_heads, dim, context_len, rescore)
         if key in self._validated:
             return
@@ -47,18 +47,57 @@ class PageAttentionClient:
                 raise ValueError("Rescore requested, but the collection's rescore budget is zero")
         self._validated.add(key)
 
+    def attention(self, query, using, *, ef=16, rescore=False, return_top_k=0):
+        """One Q vector or point ID -> dict with attention, LSE, optional token_ids.
+
+        An ID uses the stored K as Q. Candidate IDs describe the best tokens in
+        scanned pages, not all contributors to the approximate full attention.
+        """
+        if isinstance(query, np.ndarray):
+            query = query.tolist()
+        return self.attention_batch([dict(query=query, using=using, ef=ef,
+                                         rescore=rescore, return_top_k=return_top_k)])[0]
+
+    def attention_batch(self, queries):
+        if not 1 <= len(queries) <= 64:
+            raise ValueError("Attention batch must contain 1..64 queries")
+        response = self.session.post(
+            f"{self.url}/collections/{self.collection}/attention/batch",
+            json={"queries": queries}, timeout=self.timeout,
+        )
+        response.raise_for_status()
+        results = response.json()["result"]
+        if not isinstance(results, list) or len(results) != len(queries):
+            raise RuntimeError("Incomplete page-attention query batch")
+        for request, result in zip(queries, results, strict=True):
+            attention = np.asarray(result.get("attention"), dtype=np.float32)
+            if (attention.ndim != 1 or not attention.size or not np.isfinite(attention).all()
+                    or not math.isfinite(result.get("lse", float("nan")))):
+                raise RuntimeError("Invalid page-attention output")
+            k = request.get("return_top_k", 0)
+            ids = result.get("token_ids")
+            if k:
+                if (not isinstance(ids, list) or len(ids) > k
+                        or any(type(i) is not int or i < 0 for i in ids)
+                        or len(set(ids)) != len(ids)):
+                    raise RuntimeError("Invalid page-attention token IDs")
+            elif "token_ids" in result:
+                raise RuntimeError("Unexpected token IDs in attention-only response")
+        return results
+
     def query(self, queries, layer, kv_heads, *, ef=16, rescore=False,
-              scaling=None, batch_size=64):
+              scaling=None, batch_size=64, return_top_k=0):
         """[q_heads, query_tokens, dim] -> (attention, LSE), both float32.
 
         The server integrates the whole immutable context and uses 1/sqrt(dim).
-        Its returned scores are coordinates/LSE, not similarity scores or IDs.
+        With return_top_k > 0, also returns IDs as [head][query_token][candidate].
         """
         queries = np.asarray(queries, dtype=np.float32)
         if queries.ndim != 3 or min(queries.shape) <= 0:
             raise ValueError("Expected nonempty [query_heads, query_tokens, dim]")
         heads, tokens, dim = queries.shape
-        if kv_heads <= 0 or heads % kv_heads or ef <= 0 or batch_size <= 0 or layer < 0:
+        if (kv_heads <= 0 or heads % kv_heads or not 1 <= ef <= 8192
+                or not 1 <= batch_size <= 64 or layer < 0 or not 0 <= return_top_k <= 8192):
             raise ValueError("Invalid head grouping, layer, ef, or batch size")
         if not np.isfinite(queries).all():
             raise ValueError("Queries must be finite")
@@ -67,39 +106,26 @@ class PageAttentionClient:
         group = heads // kv_heads
         out = np.empty_like(queries)
         lse = np.empty((heads, tokens), dtype=np.float32)
+        token_ids = [[None for _ in range(tokens)] for _ in range(heads)] if return_top_k else None
         total = heads * tokens
         for start in range(0, total, batch_size):
             indices = [(i % heads, i // heads) for i in range(start, min(start + batch_size, total))]
-            requests = []
+            batch = []
             for h, t in indices:
-                padded = np.zeros(2 * dim, dtype=np.float32)
-                padded[:dim] = queries[h, t]
-                requests.append(grpc.QueryPoints(
-                    collection_name=self.collection,
-                    query=grpc.Query(nearest=grpc.VectorInput(
-                        dense=grpc.DenseVector(data=padded.tolist()))),
+                batch.append(dict(
+                    query=queries[h, t].tolist(),
                     using=f"l{layer:04}h{h // group:04}",
-                    params=grpc.SearchParams(hnsw_ef=ef,
-                        quantization=grpc.QuantizationSearchParams(rescore=rescore)),
-                    limit=dim + 1,
-                    with_payload=grpc.WithPayloadSelector(enable=False),
-                    with_vectors=grpc.WithVectorsSelector(enable=False),
+                    ef=ef, rescore=rescore, return_top_k=return_top_k,
                 ))
-            results = self.client.grpc_points.QueryBatch(grpc.QueryBatchPoints(
-                collection_name=self.collection, query_points=requests), timeout=self.timeout).result
-            if len(results) != len(indices):
-                raise RuntimeError("Incomplete page-attention query batch")
+            results = self.attention_batch(batch)
             for (h, t), result in zip(indices, results, strict=True):
-                points = sorted(result.result, key=lambda p: p.id.num)
-                if (any(not p.id.HasField("num") for p in points)
-                        or [p.id.num for p in points] != list(range(dim + 1))):
-                    raise RuntimeError("Invalid page-attention score channel; check index and segment count")
-                scores = np.asarray([p.score for p in points], dtype=np.float32)
-                if not np.isfinite(scores).all():
-                    raise RuntimeError("Non-finite page-attention output")
-                out[h, t] = scores[:dim]
-                lse[h, t] = scores[dim]
-        return out, lse
+                if len(result["attention"]) != dim:
+                    raise RuntimeError("Invalid page-attention output dimension")
+                out[h, t] = result["attention"]
+                lse[h, t] = result["lse"]
+                if token_ids is not None:
+                    token_ids[h][t] = result["token_ids"]
+        return (out, lse, token_ids) if return_top_k else (out, lse)
 
     def close(self):
-        self.client.close()
+        self.session.close()

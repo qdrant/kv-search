@@ -1,0 +1,8 @@
+# Add to compose.yaml when importing a generation prepared from a raw prefill cache.
+services:
+  qdrant:
+    volumes:
+      - type: bind
+        source: ${QDRANT_GENERATIONS:?Set QDRANT_GENERATIONS to the parent of your prepared work directory}
+        target: /generations
+        read_only: true
