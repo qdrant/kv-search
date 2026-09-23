@@ -1,11 +1,15 @@
 """Edge-fetch simulators over recorded retrieval. V-side (returned top-k values) unless
 noted; K (HNSW traversal) is measured separately via scripts/measure_k.py."""
 
+import math
+import warnings
+
 import numpy as np
 import torch
 
 from kv_search.analysis.data import CachedData
 from kv_search.analysis._util import kmeans, merge_topk, retrieved_weights
+from kv_search.cache import _repeat_kv
 
 
 def download_curve(d: CachedData, prompt_idx: int = 0) -> tuple[np.ndarray, np.ndarray, int]:
@@ -399,4 +403,144 @@ def cached_reuse_substitution(
         "head_sizes": head_sizes,
         "download_frac": {h: fetched[h] / distinct_all for h in head_sizes},
         **{n: {h: sse[n][h] / n_el for h in head_sizes} for n in names},
+    }
+
+
+# ---- consolidated retrieval-fundamentals analyses (aggregate layer/head/prompt) ----
+
+
+def layer_reuse(d: CachedData, n_prompts: int) -> dict:
+    """Per-layer hit-ceiling (fraction of retrievals that repeat a seen position) and
+    retention (overlap of consecutive steps' top-k), averaged over heads and prompts."""
+    layers = d.full_layer_indices
+    hc = {L: [] for L in layers}
+    ret = {L: [] for L in layers}
+    for i in range(n_prompts):
+        for L in layers:
+            _, idx_t = d.indices(L, i)
+            idx = idx_t.cpu().numpy()  # [H, q, K]
+            H, q, K = idx.shape
+            touched = np.mean([np.unique(idx[h]).size for h in range(H)])
+            hc[L].append(1 - touched / (q * K))
+            ret[L].append(
+                np.mean([
+                    len(set(idx[h, t]) & set(idx[h, t - 1])) / K
+                    for h in range(H) for t in range(1, q)
+                ])
+            )
+    return {
+        "context_len": d.context_len,
+        "layers": layers,
+        "hit_ceiling": [float(np.mean(hc[L])) for L in layers],
+        "retention": [float(np.mean(ret[L])) for L in layers],
+    }
+
+
+def live_vs_retrieved(d: CachedData, n_prompts: int) -> dict:
+    """Per-layer gap between the top live-context (dynamic) logit and the top retrieved
+    (fixed) logit, averaged over heads, steps and prompts. >0 => live out-scores."""
+    layers = d.full_layer_indices
+    sentinel = np.finfo(np.float32).min / 2
+    gap = {L: [] for L in layers}
+    for i in range(n_prompts):
+        for L in layers:
+            fixed = d.scores(L, i).cpu().numpy()  # [H, q, K]
+            dyn = d.dynamic_scores(L, i).cpu().numpy()  # [H, q, maxlen]
+            dyn = np.where(np.isnan(dyn) | (dyn < sentinel), np.nan, dyn)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                g = np.nanmax(dyn, axis=2) - np.nanmax(fixed, axis=2)  # [H, q]
+                gap[L].append(float(np.nanmean(g)))
+    return {
+        "context_len": d.context_len,
+        "layers": layers,
+        "gap": [float(np.mean(gap[L])) for L in layers],
+    }
+
+
+def cross_layer_coverage(d: CachedData, n_prompts: int) -> dict:
+    """Coverage of each layer's retrieved positions by the union of all earlier layers
+    (cumulative), vs a random-step popularity baseline, averaged over prompts."""
+    layers = d.full_layer_indices
+    cur = layers[1:]
+    act = {L: [] for L in cur}
+    base = {L: [] for L in cur}
+    rng = np.random.default_rng(0)
+    for i in range(n_prompts):
+        sets = []
+        for L in layers:
+            _, idx_t = d.indices(L, i)
+            idx = idx_t.cpu().numpy()
+            sets.append([set(idx[:, t, :].ravel().tolist()) for t in range(idx.shape[1])])
+        q = len(sets[0])
+        perm = rng.permutation(q)
+        prefix = [set(s) for s in sets[0]]
+        for li in range(1, len(layers)):
+            target = sets[li]
+
+            def cov(order):
+                return float(np.mean([
+                    len(prefix[t] & target[order[t]]) / len(target[order[t]])
+                    for t in range(q) if target[order[t]]
+                ]))
+
+            act[layers[li]].append(cov(np.arange(q)))
+            base[layers[li]].append(cov(perm))
+            for t in range(q):
+                prefix[t] |= sets[li][t]
+    return {
+        "context_len": d.context_len,
+        "layers": cur,
+        "cum_act": [float(np.mean(act[L])) for L in cur],
+        "cum_base": [float(np.mean(base[L])) for L in cur],
+    }
+
+
+def topk_mse(d: CachedData, n_prompts: int = 0, n_positions: int = 8, n_k: int = 30,
+             chunk_q: int = 2) -> dict:
+    """MSE between full attention and top-k attention vs k, and a random-k baseline;
+    averaged over layers, heads and the last `n_positions` prefill queries. Needs prefill.
+    n_prompts is ignored (this uses prefill queries, not decode prompts)."""
+    assert d.prefill is not None, "needs load_prefill=True"
+    acc = acc_r = None
+    ks_all: np.ndarray | None = None
+    n_layers = 0
+    for layer_idx, layer in d.full_layers:
+        keys = _repeat_kv(layer.keys[:, :, : d.context_len, :], d.num_key_value_groups)
+        values = _repeat_kv(layer.values[:, :, : d.context_len, :], d.num_key_value_groups)
+        keys = keys[0].to(d.device, torch.float32)  # [16, ctx, dim]
+        values = values[0].to(d.device, torch.float32)
+        q = d.queries(layer_idx, slice(-n_positions, None)).to(d.device, torch.float32)[0]  # [16, P, dim]
+        ctx = keys.shape[1]
+        ks = np.unique(np.logspace(0, math.log2(ctx - 1), n_k, base=2).astype(int))
+        mse = np.zeros(len(ks))
+        mse_r = np.zeros(len(ks))
+        chunks = 0
+        for s in range(0, q.shape[1], chunk_q):
+            qc = q[:, s : s + chunk_q]  # [16, c, dim]
+            logits = torch.einsum("hcd,hxd->hcx", qc, keys) * d.scaling
+            o_full = torch.einsum("hcx,hxd->hcd", torch.softmax(logits, -1), values)
+            order = logits.argsort(-1, descending=True)
+            rand = torch.argsort(torch.rand_like(logits), -1)
+            for ki, k in enumerate(ks):
+                sp = logits.scatter(-1, order[..., int(k):], float("-inf"))
+                o = torch.einsum("hcx,hxd->hcd", torch.softmax(sp, -1), values)
+                mse[ki] += float(((o_full - o) ** 2).mean())
+                sp = logits.scatter(-1, rand[..., int(k):], float("-inf"))
+                o = torch.einsum("hcx,hxd->hcd", torch.softmax(sp, -1), values)
+                mse_r[ki] += float(((o_full - o) ** 2).mean())
+            chunks += 1
+        mse /= chunks
+        mse_r /= chunks
+        if acc is None:
+            acc, acc_r, ks_all = mse, mse_r, ks
+        else:
+            acc += mse
+            acc_r += mse_r
+        n_layers += 1
+    return {
+        "context_len": d.context_len,
+        "ks": [int(x) for x in ks_all],
+        "mse": (acc / n_layers).tolist(),
+        "mse_random": (acc_r / n_layers).tolist(),
     }

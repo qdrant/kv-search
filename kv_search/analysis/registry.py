@@ -93,4 +93,9 @@ ANALYSES: dict[str, Analysis] = {
     "meanfield": Analysis(_meanfield, needs_prefill=True, per_prompt=True),
     "reuse": Analysis(_reuse, needs_prefill=True, per_prompt=True),
     "centroid": Analysis(_centroid, needs_prefill=True, per_prompt=False),
+    # retrieval fundamentals (aggregate over layer/head/prompt)
+    "layer_reuse": Analysis(fetch.layer_reuse, needs_prefill=False, per_prompt=True),
+    "live_vs_retrieved": Analysis(fetch.live_vs_retrieved, needs_prefill=False, per_prompt=True),
+    "cross_layer_coverage": Analysis(fetch.cross_layer_coverage, needs_prefill=False, per_prompt=True),
+    "topk_mse": Analysis(fetch.topk_mse, needs_prefill=True, per_prompt=False),
 }
