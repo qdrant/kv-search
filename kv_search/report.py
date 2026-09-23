@@ -146,6 +146,55 @@ def make_figures(fig_dir: Path = FIG_DIR) -> list[Path]:
             ax.legend()
         save(fig, "tail_meanfield.png")
 
+    # --- retrieval fundamentals (one axis, sizes as lines) ---
+    tm = _sizes("topk_mse")
+    if tm:
+        fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
+        for s in _order(tm):
+            ax.loglog(tm[s]["ks"], tm[s]["mse"], "-", base=2, color=COLORS[s], label=s)
+            ax.loglog(tm[s]["ks"], tm[s]["mse_random"], "--", base=2, color=COLORS[s], alpha=.5)
+        ax.set_xlabel("k (top-k kept)")
+        ax.set_ylabel("attention-output MSE vs full (log)")
+        ax.set_title("Top-k suffices (solid); random-k baseline (dashed)")
+        ax.legend()
+        save(fig, "topk_mse.png")
+
+    lr = _sizes("layer_reuse")
+    if lr:
+        fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4.5), layout="constrained")
+        for s in _order(lr):
+            a1.plot(lr[s]["layers"], lr[s]["hit_ceiling"], "o-", color=COLORS[s], label=s)
+            a2.plot(lr[s]["layers"], lr[s]["retention"], "o-", color=COLORS[s], label=s)
+        a1.set(xlabel="full-attention layer", ylabel="hit ceiling", title="Reuse: hit ceiling")
+        a2.set(xlabel="full-attention layer", ylabel="retention", title="Reuse: step-to-step retention")
+        a1.legend()
+        save(fig, "layer_reuse.png")
+
+    lv = _sizes("live_vs_retrieved")
+    if lv:
+        fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
+        ax.axhline(0, color="0.6", lw=0.8)
+        for s in _order(lv):
+            ax.plot(lv[s]["layers"], lv[s]["gap"], "o-", color=COLORS[s], label=s)
+        ax.set_xlabel("full-attention layer")
+        ax.set_ylabel("top live logit - top retrieved logit")
+        ax.set_title("Live context out-scores retrieved in shallow layers")
+        ax.legend()
+        save(fig, "live_vs_retrieved.png")
+
+    cc = _sizes("cross_layer_coverage")
+    if cc:
+        fig, ax = plt.subplots(figsize=(8, 5), layout="constrained")
+        for s in _order(cc):
+            ax.plot(cc[s]["layers"], cc[s]["cum_act"], "o-", color=COLORS[s], label=s)
+            ax.plot(cc[s]["layers"], cc[s]["cum_base"], "o--", color=COLORS[s], alpha=.5)
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("full-attention layer")
+        ax.set_ylabel("coverage by earlier layers")
+        ax.set_title("Cross-layer position reuse (solid); popularity baseline (dashed)")
+        ax.legend()
+        save(fig, "cross_layer_coverage.png")
+
     return written
 
 
