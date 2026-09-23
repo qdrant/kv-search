@@ -1105,7 +1105,7 @@ class CmdChat(TailmFlags, ProjDir):
             timers.reset_generation()
             torch.cuda.reset_peak_memory_stats()
             try:
-                prompt_len, out = self._generate(
+                prompt_len, out, logits = self._generate(
                     model, processor, cache, context_len, streamer, user
                 )
                 if record:
@@ -1131,8 +1131,13 @@ class CmdChat(TailmFlags, ProjDir):
                         prompt_len,
                         user,
                         answer,
+                        logits=logits,
                     )
-                    console.print(f"[green]recorded {n_rows} positions -> {path}[/]")
+                    console.print(
+                        f"[green]recorded {n_rows} positions"
+                        f"{f', logits {tuple(logits.shape)}' if logits is not None else ''}"
+                        f" -> {path}[/]"
+                    )
                 prompt_idx += 1
             except KeyboardInterrupt:
                 streamer.end()
@@ -1152,7 +1157,7 @@ class CmdChat(TailmFlags, ProjDir):
         context_len: int,
         streamer: TimedStreamer,
         user: str,
-    ) -> tuple[int, torch.Tensor]:
+    ) -> tuple[int, torch.Tensor, torch.Tensor | None]:
         inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
             add_generation_prompt=True,
@@ -1169,16 +1174,27 @@ class CmdChat(TailmFlags, ProjDir):
             context_len, context_len + prompt_len, device=model.device
         ).unsqueeze(0)
 
-        out: torch.Tensor = model.generate(  # ty:ignore[invalid-assignment]
+        gen_kwargs: dict[str, Any] = {}
+        if self.record_prompts:
+            # collect per-step next-token logits for the recording
+            gen_kwargs["output_logits"] = True
+            gen_kwargs["return_dict_in_generate"] = True
+
+        out = model.generate(  # ty:ignore[invalid-argument-type]
             **inputs,  # ty:ignore[invalid-argument-type]
             max_new_tokens=self.max_new_tokens,
             past_key_values=cache,
             use_cache=True,
             streamer=streamer,
             do_sample=False,
-        )  # ty:ignore[invalid-argument-type]
+            **gen_kwargs,
+        )
 
-        return prompt_len, out
+        if self.record_prompts:
+            # out.logits: tuple (len = num_generated) of [1, vocab] -> [num_generated, vocab]
+            logits = torch.stack(out.logits, dim=0)[:, 0, :]  # ty:ignore[unresolved-attribute, invalid-argument-type]
+            return prompt_len, out.sequences, logits  # ty:ignore[unresolved-attribute]
+        return prompt_len, out, None  # ty:ignore[invalid-return-type]
 
 
 class CmdAnalyze(BaseModel):
