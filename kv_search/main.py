@@ -40,7 +40,7 @@ import rich
 import torch
 import transformers.utils.logging
 from pydantic import BaseModel, Field
-from pydantic_settings import CliApp, CliSubCommand
+from pydantic_settings import CliApp, CliPositionalArg, CliSubCommand
 from rich.console import Console
 from rich.progress import track
 from rich.table import Table
@@ -68,7 +68,7 @@ with contextlib.redirect_stdout(io.StringIO()):
         TextStreamer,
     )
 
-from kv_search.analysis import CachedData
+from kv_search.analysis import CachedData, plots
 from kv_search.cache import (
     FullContextRetriever,
     QdrantEdgeNativeRetriever,
@@ -534,10 +534,12 @@ class CmdChat(BaseModel):
                     "kv_search_commit": _git_commit(),
                 },
             )
-            if not isinstance(self.retriever, FullContextRetriever):
+            if not isinstance(
+                self.retriever, (FullContextRetriever, QdrantEdgeNativeRetriever)
+            ):
                 console.print(
-                    "[yellow]record_prompts only records under `-r full`; "
-                    "switch with /full in the repl[/]"
+                    "[yellow]record_prompts only records under `-r full` or `-r native`; "
+                    "switch with /full or /native in the repl[/]"
                 )
 
         cache = RetrievalCache(
@@ -623,7 +625,7 @@ class CmdChat(BaseModel):
                 cache.retriever.reset_indices()
 
             record_prompt = cache.recorder is not None and isinstance(
-                cache.retriever, FullContextRetriever
+                cache.retriever, (FullContextRetriever, QdrantEdgeNativeRetriever)
             )
             if record_prompt:
                 cache.recorder.reset()
@@ -721,19 +723,54 @@ class CmdChat(BaseModel):
         return prompt_len, out, None  # ty:ignore[invalid-return-type]
 
 
-class CmdAnalyze(BaseModel):
+class CmdFigures(BaseModel):
+    """Exploratory figures/tables (index heatmap, scores, cross-layer, mse) into the cache dir."""
+
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
     qdrant_size: str = "100k"
 
     def cli_cmd(self) -> None:
         config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
-
         cache_dir = _cache_dir(self.dataset_name, self.qdrant_size, config.model_type)
         cache_dir.mkdir(exist_ok=True, parents=True)
-
         data = CachedData(cache_dir, model_name=self.model_name)
-        data.analyze()
+        plots.analyze(data)
+
+
+class CmdAnalyze(BaseModel):
+    """Run registered analyses over sizes and write envelopes to cache/analysis/.
+    names and sizes are comma-separated (e.g. `analyze sweep,reuse -s 100k,1M`)."""
+
+    names: CliPositionalArg[str]
+    sizes: str = "100k,200k,1M"
+    n_prompts: int = 5
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+
+    def cli_cmd(self) -> None:
+        from kv_search.analysis import io, registry
+
+        config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
+        for name in self.names.split(","):
+            a = registry.ANALYSES[name]
+            sizes_out: dict = {}
+            for size in self.sizes.split(","):
+                cache_dir = _cache_dir(self.dataset_name, size, config.model_type)
+                if a.per_prompt and len(sorted(cache_dir.glob("indices0*/"))) < self.n_prompts:
+                    console.print(f"[yellow]skip {name}/{size}: <{self.n_prompts} prompts[/]")
+                    continue
+                data = CachedData(
+                    cache_dir, model_name=self.model_name, load_prefill=a.needs_prefill
+                )
+                sizes_out[size] = a.run(data, self.n_prompts)
+                console.print(f"[green]{name}/{size} done[/]")
+                del data
+                torch.cuda.empty_cache()
+            path = io.write_envelope(
+                name, self.model_name, {"n_prompts": self.n_prompts}, sizes_out
+            )
+            console.print(f"[green]wrote {path}[/]")
 
 
 def _encode_eval(
@@ -1117,6 +1154,79 @@ class CmdEval(BaseModel):
         console.print(f"wrote {out_path}")
 
 
+class CmdRecord(BaseModel):
+    """Record retrieval data across sizes by driving `chat` over a prompts file.
+    kind=indices -> topk oracle (--record-indices); kind=queries -> native decode
+    queries (--record-prompts)."""
+
+    kind: Literal["indices", "queries"] = "indices"
+    sizes: str = "100k,200k,1M"
+    prompts: str = "prompts_sweep.txt"
+    max_new_tokens: int = 256
+    n_retrieved: int = 128
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+
+    def cli_cmd(self) -> None:
+        for size in self.sizes.split(","):
+            retriever = (
+                TopKRetriever(n_retrieved=self.n_retrieved)
+                if self.kind == "indices"
+                else QdrantEdgeNativeRetriever(n_retrieved=self.n_retrieved)
+            )
+            chat = CmdChat(
+                model_name=self.model_name,
+                dataset_name=self.dataset_name,
+                qdrant_size=size,
+                retriever=retriever,
+                max_new_tokens=self.max_new_tokens,
+                render_live=False,
+                record_indices=(self.kind == "indices"),
+                record_prompts=(self.kind == "queries"),
+            )
+            with open(self.prompts) as f:  # feed prompts to the (stdin-driven) repl
+                orig, sys.stdin = sys.stdin, f
+                try:
+                    chat.cli_cmd()
+                finally:
+                    sys.stdin = orig
+
+
+class CmdRebuildShards(BaseModel):
+    """Rebuild edge shards as HNSW-indexed single-segment shards from the existing
+    prefill (no re-prefill). Needs qdrant running at `url`."""
+
+    sizes: str = "100k,200k,1M"
+    url: str = "localhost"
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+
+    def cli_cmd(self) -> None:
+        config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
+        for size in self.sizes.split(","):
+            cache_dir = _cache_dir(self.dataset_name, size, config.model_type)
+            cache, ctx = load_cache(cache_dir, config, "cpu")
+            console.print(f"[{size}] ctx={ctx}; upserting -> {cache_dir}/edge")
+            _upsert(cache, self.url, edge_root=cache_dir / "edge", parallel=1)
+            del cache
+            console.print(f"[green]{size} done[/]")
+
+
+class CmdReport(BaseModel):
+    """Regenerate report figures from the analysis envelopes and compose report/*.md
+    into one standalone HTML file."""
+
+    report_dir: str = "report"
+    out: str = "cache/report/report.html"
+
+    def cli_cmd(self) -> None:
+        from kv_search import report as rp
+
+        rp.make_figures()
+        path = rp.build_html(report_dir=Path(self.report_dir), out=Path(self.out))
+        console.print(f"[green]wrote {path}[/]")
+
+
 class CmdKvSearch(
     BaseModel,
     cli_shortcuts={
@@ -1133,6 +1243,10 @@ class CmdKvSearch(
     prefill: CliSubCommand[CmdPrefill]
     chat: CliSubCommand[CmdChat]
     analyze: CliSubCommand[CmdAnalyze]
+    figures: CliSubCommand[CmdFigures]
+    record: CliSubCommand[CmdRecord]
+    rebuild_shards: CliSubCommand[CmdRebuildShards]
+    report: CliSubCommand[CmdReport]
     eval: CliSubCommand[CmdEval]
 
     def cli_cmd(self) -> None:

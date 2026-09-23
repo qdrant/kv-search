@@ -82,3 +82,14 @@ docs/_build/
 
 # Pyenv
 .python-version
+
+RUNBOOK.md
+
+/*.png
+notebooks/*.png
+notebooks/*_files/
+notebooks/fig_edge/
+notebooks/edge_download.html
+notebooks/edge_download_report.md
+
+scratch/

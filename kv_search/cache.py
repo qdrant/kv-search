@@ -460,7 +460,9 @@ class RetrievalCache(DynamicCache):
         if (
             self.recorder is not None
             and query_states is not None
-            and isinstance(self.retriever, FullContextRetriever)
+            and isinstance(
+                self.retriever, (FullContextRetriever, QdrantEdgeNativeRetriever)
+            )
         ):
             self.recorder.record_query(layer_idx, query_states)
 
