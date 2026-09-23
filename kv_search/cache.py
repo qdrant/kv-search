@@ -165,6 +165,8 @@ class TopKRetriever(BaseModel):
 
     def reset_indices(self) -> None:
         self._indices.clear()
+        self._scores.clear()
+        self._dynamic_scores.clear()
 
     def record_dynamic_scores(self, layer_idx: int, scores: torch.Tensor) -> None:
         self._dynamic_scores.setdefault(layer_idx, []).append(
@@ -772,8 +774,12 @@ class SessionRecorder:
         prompt_len: int,
         prompt: str,
         answer: str,
+        logits: torch.Tensor | None = None,
     ) -> Path:
         tensors = {name: torch.cat(cs, dim=0) for name, cs in self._chunks.items()}
+
+        if logits is not None:
+            tensors["logits"] = logits.to("cpu", torch.float32).contiguous()
 
         for layer_idx in sorted(self._layers):
             layer = cache.layers[layer_idx]
