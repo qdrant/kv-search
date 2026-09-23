@@ -560,6 +560,24 @@ def _unshuffle_bf16(u: torch.Tensor) -> torch.Tensor:
     )
 
 
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _layer_files(path: Path) -> list[Path]:
+    """The layer files of a saved cache, raw ``layer_NN.safetensors`` preferred over
+    ``layer_NN.safetensors.zst`` (the two globs never overlap)."""
+    raw = sorted(path.glob("layer_*.safetensors"))
+    return raw if raw else sorted(path.glob("layer_*.safetensors.zst"))
+
+
+def _read_layer(file: Path) -> dict:
+    """Load one layer file, decompressing only if it starts with the zstd magic."""
+    blob = file.read_bytes()
+    if blob[:4] == _ZSTD_MAGIC:
+        blob = compression.zstd.decompress(blob)
+    return load(blob)
+
+
 @timers.prefill_save
 def save_cache(
     cache: Cache,
@@ -582,10 +600,10 @@ def load_cache(
     cache = DynamicCache(config=config)
     meta = json.loads((path / "meta.json").read_text())
 
-    files = sorted(path.glob("layer_*.safetensors.zst"))
+    files = _layer_files(path)
     assert len(files) == len(cache.layers)
     for layer, file in zip(cache.layers, files):
-        tensors = load(compression.zstd.decompress(file.read_bytes()))
+        tensors = _read_layer(file)
         for k, v in tensors.items():
             tensors[k] = _unshuffle_bf16(v).to(device, non_blocking=True)
         if isinstance(layer, LinearAttentionCacheLayerMixin):
