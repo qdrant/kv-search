@@ -41,6 +41,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import CliApp, CliSubCommand
 from rich.console import Console
 from rich.progress import track
+from safetensors import SafetensorError
 
 # auto_docstring emits [ERROR] lines via print() at class-definition time
 with contextlib.redirect_stdout(io.StringIO()):
@@ -64,7 +65,9 @@ with contextlib.redirect_stdout(io.StringIO()):
         Qwen3VLProcessor,
         TextStreamer,
     )
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 
+from kv_search._native import tailm_kernel
 from kv_search.analysis import CachedData
 from kv_search.cache import (
     FullContextRetriever,
@@ -80,6 +83,8 @@ from kv_search.cache import (
     save_cache,
 )
 from kv_search.data import Datasets, Message, load_dataset
+from kv_search.tailm import VERSION as TAILM_VERSION
+from kv_search.tailm_runtime import TailmCheck, TailmRuntime
 from kv_search.timer import timers
 
 transformers.utils.logging.set_verbosity(transformers.utils.logging.CRITICAL)
@@ -146,12 +151,12 @@ def _yarn_factor(context_tokens: int) -> int:
     return max(1, math.ceil(context_tokens / NATIVE_MAX_POSITIONS))
 
 
-@timers.model_load
-def _load_model(
-    model_name: ModelName, context_tokens: int = 0
-) -> tuple[ModelType, ProcessorType]:
-    config = AutoConfig.from_pretrained(model_name)
-
+def _apply_yarn(config: Any, context_tokens: int) -> int:
+    """Flip `config` to YaRN when the tier exceeds the native window; returns the
+    factor (1 = untouched). Every path that hands a config to something
+    RoPE-aware (`_load_model`, the tailM build's `tailm.rope_inv_freq`) must go
+    through here so prefill keys, decode queries and shifted prefill queries
+    all agree on the frequencies."""
     factor = _yarn_factor(context_tokens)
     if factor > 1:
         # nested text_config for multimodal Qwen3.5; fall back to top-level
@@ -167,6 +172,25 @@ def _load_model(
             f"(context ~{context_tokens:,} > native {NATIVE_MAX_POSITIONS:,}); "
             f"rope={rope}[/]"
         )
+    return factor
+
+
+def load_model_config(model_name: str, context_tokens: int = 0) -> Any:
+    """The HF config for `model_name` as the tier of `context_tokens` runs it:
+    YaRN-patched above the native window, untouched below. Use this -- not a bare
+    `AutoConfig.from_pretrained` -- wherever the config feeds anything RoPE-aware,
+    so scripts and commands can never shift queries with frequencies the prefill
+    did not use."""
+    config = AutoConfig.from_pretrained(model_name)
+    _apply_yarn(config, context_tokens)
+    return config
+
+
+@timers.model_load
+def _load_model(
+    model_name: ModelName, context_tokens: int = 0
+) -> tuple[ModelType, ProcessorType]:
+    config = load_model_config(model_name, context_tokens)
 
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
     load_kwargs = dict(
@@ -467,7 +491,121 @@ _RETRIEVERS: dict[str, type[RetrieverConfig]] = {
 }
 
 
-class CmdChat(BaseModel):
+TAILM_MODEL = "Qwen/Qwen3.5-9B"  # only _qwen_3_5_forward calls a retriever
+TAILM_RETRIEVERS = ("topk", "native")  # the retrievers that report the tail boundary
+
+
+def _full_attention_cells(text_config: Any) -> list[tuple[int, int]]:
+    """Every (full-attention layer, KV head) of the model: the cells a tailM file can belong to."""
+    return [
+        (i, h)
+        for i, t in enumerate(text_config.layer_types)
+        if t == "full_attention"
+        for h in range(text_config.num_key_value_heads)
+    ]
+
+
+def _print_plain(lines: list[str]) -> None:
+    """Print without rich markup, so bracketed text in gate reasons stays literal."""
+    for line in lines:
+        console.print(line, markup=False, highlight=False)
+
+
+class TailmFlags(BaseModel):
+    """Opt-in tail correction (tailM) for retrieval attention
+    (docs/superpowers/specs/2026-09-23-tailm-runtime-design.md). A subcommand that builds a
+    RetrievalCache gets it by inheriting these flags and calling the methods below."""
+
+    # add back the dropped prefill keys' softmax mass on the heads scripts/build_tailm.py gated on
+    tailm: bool = False
+    # the build's --out; default <cache_dir>/tailm
+    tailm_dir: Path | None = None
+    # after each answer, print today's vs tailM's attention error against exact attention
+    tailm_check: bool = False
+
+    def tailm_preflight(self, model_name: str, retriever_type: str) -> None:
+        """Flag checks that need no model or cache (runtime spec §7.4)."""
+        if self.tailm_check and not self.tailm:
+            raise SystemExit("error: --tailm-check needs --tailm")
+        if not self.tailm:
+            return
+        if model_name != TAILM_MODEL:
+            raise SystemExit(
+                f"error: --tailm supports only {TAILM_MODEL} (got {model_name})"
+            )
+        if retriever_type not in TAILM_RETRIEVERS:
+            raise SystemExit(
+                f"error: --tailm needs -r topk or -r native (got -r {retriever_type})"
+            )
+
+    def tailm_folder(self, cache_dir: Path) -> Path:
+        return self.tailm_dir if self.tailm_dir is not None else cache_dir / "tailm"
+
+    def tailm_load(
+        self,
+        model_name: str,
+        text_config: Any,
+        scaling: float,
+        device: Any,
+        cache_dir: Path,
+        context_len: int,
+        n_retrieved: int,
+        retriever_type: str | None = None,
+    ) -> tuple[TailmRuntime | None, TailmCheck | None]:
+        """Load the tailM files, print the startup message (runtime spec §7.2, §7.3); on -r native
+        it also names the Rust decode tail's kernel."""
+        if not self.tailm:
+            return None, None
+        try:
+            runtime = TailmRuntime.load(
+                self.tailm_folder(cache_dir),
+                model=model_name,
+                context_len=context_len,
+                n_retrieved=n_retrieved,
+                head_dim=text_config.head_dim,
+                scaling=scaling,
+                cells=_full_attention_cells(text_config),
+                group=text_config.num_attention_heads
+                // text_config.num_key_value_heads,
+                device=device,
+            )
+        except ValueError as e:
+            msg = str(e)
+            if (
+                "tailM file version" in msg
+            ):  # tailm.load_head: a file of another format version
+                msg += f"; rebuild the files with scripts/build_tailm.py (current version {TAILM_VERSION})"
+            raise SystemExit(f"error: --tailm: {msg}")
+        except KeyError as e:
+            raise SystemExit(
+                f"error: --tailm: a head file lacks metadata key {e}; rebuild it with scripts/build_tailm.py"
+            )
+        except SafetensorError as e:
+            raise SystemExit(
+                f"error: --tailm: unreadable head file in {self.tailm_folder(cache_dir)}: {e}"
+            )
+        lines = runtime.describe()
+        if retriever_type == "native":
+            lines.append(
+                f"  native: decode tail in Rust (bf16 weights, {tailm_kernel()})"
+            )
+        _print_plain(lines)
+        return runtime, TailmCheck(runtime) if self.tailm_check else None
+
+    @staticmethod
+    def tailm_attach(retriever: Any, runtime: TailmRuntime | None) -> None:
+        """-r native with --tailm: register the tail with the Rust engine once at startup, so a bad
+        shard folder or tail state stops `chat` here, not mid-answer. `attend` still attaches per
+        call (idempotent) for a /native switch in the REPL."""
+        if runtime is None or not hasattr(retriever, "attach_tailm"):
+            return
+        try:
+            retriever.attach_tailm(runtime)
+        except Exception as e:
+            raise SystemExit(f"error: --tailm: native decode tail: {e}")
+
+
+class CmdChat(TailmFlags):
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
     qdrant_size: str = "100k"
@@ -477,6 +615,7 @@ class CmdChat(BaseModel):
     record_indices: bool = False
 
     def cli_cmd(self) -> None:
+        self.tailm_preflight(self.model_name, self.retriever.type)
         context_tokens = (
             _size_to_tokens(self.qdrant_size)
             if self.dataset_name == Datasets.QDRANT
@@ -498,8 +637,30 @@ class CmdChat(BaseModel):
         if self.record_indices and isinstance(self.retriever, TopKRetriever):
             self.retriever.record_indices = self.record_indices
 
+        tailm, check = None, None
+        if self.tailm:
+            # tailm_preflight admitted only Qwen3.5-9B with -r topk / -r native
+            assert isinstance(
+                self.retriever, (TopKRetriever, QdrantEdgeNativeRetriever)
+            )
+            attn = next(m for m in model.modules() if isinstance(m, Qwen3_5Attention))
+            tailm, check = self.tailm_load(
+                self.model_name,
+                getattr(model.config, "text_config", model.config),
+                attn.scaling,
+                model.device,
+                cache_dir,
+                context_len,
+                self.retriever.n_retrieved,
+                retriever_type=self.retriever.type,
+            )
+            self.tailm_attach(self.retriever, tailm)
         cache = RetrievalCache(
-            retriever=self.retriever, prefill=prefill, config=model.config
+            retriever=self.retriever,
+            prefill=prefill,
+            config=model.config,
+            tailm=tailm,
+            check=check,
         )
 
         streamer = TimedStreamer(processor.tokenizer, skip_prompt=True)
@@ -597,6 +758,9 @@ class CmdChat(BaseModel):
                 cache.reset()
 
             _print_stats()
+            if cache.check is not None:
+                _print_plain(cache.check.report())
+                cache.check.reset()
 
     def _generate(
         self,
