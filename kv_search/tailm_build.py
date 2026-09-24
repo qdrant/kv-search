@@ -1,8 +1,6 @@
 """tailM build: loading, one scan over all keys, the per-cut ladder, ridge fit, cut choice, gate, α.
 
-Spec §5–§6 (`docs/superpowers/specs/2026-09-23-tailm-build-design.md`). Everything is torch on one
-device. Mirrors the research method (research branch `build/tail-cut/cut_sweep3.py`,
-`tail_guard.py`) so the defaults reproduce its numbers.
+Usage and options: `docs/tailm-build.md`. Everything is torch on one device.
 """
 
 import compression.zstd
@@ -38,7 +36,7 @@ _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 @dataclass(frozen=True)
 class CutShift:
-    """`--cut-shift`: `P%` adds round(cut·P/100), an integer `k` adds k (spec §4)."""
+    """`--cut-shift`: `P%` adds round(cut·P/100), an integer `k` adds k."""
 
     text: str
     percent: bool
@@ -146,7 +144,7 @@ def tier_label(cache_dir: Path) -> str | None:
 
 def tier_context_tokens(cache_dir: Path) -> int:
     """The context tokens `prefill` hands the YaRN patch for this cache: the qdrant tier label's
-    tokens (`_size_to_tokens`), else 0 (other datasets run without YaRN). Spec §3."""
+    tokens (`_size_to_tokens`), else 0 (other datasets run without YaRN)."""
     label = tier_label(cache_dir)
     if label is None:
         return 0
@@ -156,7 +154,7 @@ def tier_context_tokens(cache_dir: Path) -> int:
 
 
 def resolve_context_tokens(cache_dir: Path, context_len: int, given: int | None) -> int:
-    """The context tokens for the YaRN patch (spec §3): `given` if set, else the qdrant tier label's
+    """The context tokens for the YaRN patch: `given` if set, else the qdrant tier label's
     tokens, else 0 -- but only when the cache fits the native window. A longer cache at a path without
     a tier label is refused: prefill ran it with a YaRN factor we cannot see, and building without YaRN
     rotates the shifted queries wrongly while making the prefill numbers look better (measured on
@@ -257,9 +255,9 @@ def sample_queries(
     inv_freq: np.ndarray,
     group: int,
 ) -> np.ndarray:
-    """The build's prefill queries for one head (spec §6.1; research `cut_sweep3.py queries()`):
-    `samples` distinct prompt positions, their `group` q-heads RoPE-shifted to
-    `context_len + U[0, SHIFT_SPAN)`, one random q-head kept per position. f32 `[samples, d]`.
+    """The build's prefill queries for one head: `samples` distinct prompt positions, their
+    `group` q-heads RoPE-shifted to `context_len + U[0, SHIFT_SPAN)`, one random q-head kept per
+    position. f32 `[samples, d]`.
     """
     rng = np.random.default_rng(seed)
     pos = np.sort(rng.choice(context_len, samples, replace=False))
@@ -273,7 +271,7 @@ def sample_queries(
 
 
 def split_indices(samples: int, heldout: int) -> tuple[np.ndarray, np.ndarray]:
-    """(held-out, train) row indices; the research split (`default_rng(0).permutation`)."""
+    """(held-out, train) row indices (`default_rng(0).permutation`)."""
     perm = np.random.default_rng(0).permutation(samples)
     return perm[:heldout], perm[heldout:]
 
@@ -318,10 +316,10 @@ def scan(
     moments: bool = True,
     on_chunk: Callable[[int, int], None] | None = None,
 ) -> ScanResult:
-    """One pass over all keys for H heads at once (spec §6.2).
+    """One pass over all keys for H heads at once.
 
     Q [H, P, d] f32, K/V [H, n_keys, d] bf16, all on one device. Online softmax (f32 scores, exp
-    and w @ v; f64 running totals, as research cut_sweep3.py), the top-`kmax` scores and ids per
+    and w @ v; f64 running totals), the top-`kmax` scores and ids per
     query (two-stage: the chunk's own top-kmax, then a merge with the running top-kmax), and with
     `moments` the f64 key sums Σk, ΣkkT. `on_chunk(keys_done, n_keys)` after every chunk.
     """
@@ -386,10 +384,10 @@ def top_sums(
     cuts: list[int],
     max_bytes: int = 1 << 30,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """D_top and N_top at every cut for one head (spec §6.3), f64.
+    """D_top and N_top at every cut for one head, f64.
 
     top_sc [P, k] f32 descending, top_ix [P, k], m [P] (the scan's max), V [n_keys, d] bf16,
-    `cuts` strictly ascending with cuts[-1] ≤ k. As research cut_sweep3.py: D by a cumulative sum
+    `cuts` strictly ascending with cuts[-1] ≤ k. D by a cumulative sum
     over ranks; N by per-segment sums between consecutive cut edges and a cumulative sum over the
     segments. Values are gathered in query slices so one [slice, cuts[-1], d] f64 block stays
     under `max_bytes`. Returns (Dt [C, P], Nt [C, P, d]).
@@ -415,7 +413,7 @@ def top_sums(
 
 
 def ridge_fit(X: torch.Tensor, Y: torch.Tensor, ridge: float) -> torch.Tensor:
-    """Ridge least squares for every cut at once (spec §6.3).
+    """Ridge least squares for every cut at once.
 
     X [n, d+1] f64 = [unit query, 1] (train rows), Y [C, n, d] f64 = unit tail direction per cut.
     A = XᵀX + λI with λ = ridge·mean(diag XᵀX) is the same for every cut, so one Cholesky solves
@@ -436,13 +434,13 @@ def ridge_fit(X: torch.Tensor, Y: torch.Tensor, ridge: float) -> torch.Tensor:
 
 ALPHAS = [
     round(i * 0.05, 2) for i in range(31)
-]  # mass-factor grid 0 .. 1.5 (research tail_guard.py); rounded so the stored α reads 0.6, not 0.6000000000000001
+]  # mass-factor grid 0 .. 1.5; rounded so the stored α reads 0.6, not 0.6000000000000001
 _STAT_KEY = {"mean": "err_mean", "p90": "err_p90"}
 
 
 @dataclass
 class CutEval:
-    """Held-out numbers and per-cut tensors for one head (spec §6.3)."""
+    """Held-out numbers and per-cut tensors for one head."""
 
     cuts: list[int]
     stats: dict[int, dict[str, float]]
@@ -469,7 +467,7 @@ def evaluate_cuts(
     ridge: float,
 ) -> CutEval:
     """Every cut at once: true tail, ridge map (train rows), stand-in, truncation-aware Gaussian
-    mass, and the held-out numbers (spec §6.3). `q` [P, d] f32 are the build queries; `tr`, `te`
+    mass, and the held-out numbers. `q` [P, d] f32 are the build queries; `tr`, `te`
     index rows of `q`."""
     P = q.shape[0]
     qn = unit(q.to(F64))
@@ -524,7 +522,7 @@ def evaluate_cuts(
 def choose_cut(
     stats: dict[int, dict[str, float]], ladder: list[int], eps: float, eps_stat: str
 ) -> tuple[int, bool]:
-    """The smallest ladder cut whose `eps_stat` error is ≤ eps; else (deepest, False). Spec §6.4."""
+    """The smallest ladder cut whose `eps_stat` error is ≤ eps; else (deepest, False)."""
     key = _STAT_KEY[eps_stat]
     for c in ladder:
         if stats[c][key] <= eps:
@@ -535,7 +533,7 @@ def choose_cut(
 def _runtime_errs(
     ev: CutEval, fit_cut: int, keep: int, idx: torch.Tensor, alphas: torch.Tensor
 ) -> torch.Tensor:
-    """tailM error [A, n] at the runtime configuration (spec §6.5): exact part and Gaussian boundary at
+    """tailM error [A, n] at the runtime configuration: exact part and Gaussian boundary at
     the `keep` kept keys, stand-in from the map fitted at `fit_cut`, mass scaled by each α.
     """
     k, f = ev.cuts.index(keep), ev.cuts.index(fit_cut)
@@ -548,7 +546,7 @@ def fit_alpha(
     ev: CutEval, fit_cut: int, keep: int, tr: torch.Tensor, te: torch.Tensor
 ) -> tuple[float, float]:
     """α on the train split at the runtime configuration (grid ALPHAS, first minimum), and the held-out
-    mean error with it. Mass multiplier out = (N_top + α·Ẑ·û)/(D_top + α·Ẑ), applied at runtime (spec §6.6).
+    mean error with it. Mass multiplier out = (N_top + α·Ẑ·û)/(D_top + α·Ẑ), applied at runtime.
     """
     grid = torch.tensor(ALPHAS, dtype=F64, device=ev.Z.device)
     k = int(torch.argmin(_runtime_errs(ev, fit_cut, keep, tr, grid).mean(1)))
@@ -559,7 +557,7 @@ def fit_alpha(
 
 def ratio_stats(err: torch.Tensor, base: torch.Tensor) -> dict[str, float]:
     """`worse` = share of rows with err > base; p99 / max (and median) of err/base over those rows,
-    1.0 when no row is worse (spec §6.7)."""
+    1.0 when no row is worse."""
     w = err > base
     r = (err / base)[w]
     return {
@@ -573,7 +571,7 @@ def ratio_stats(err: torch.Tensor, base: torch.Tensor) -> dict[str, float]:
 def runtime_stats(
     ev: CutEval, fit_cut: int, keep: int, alpha: float, te: torch.Tensor
 ) -> dict[str, float]:
-    """Held-out prefill numbers at the runtime configuration (spec §6.5); `none` = kept keys only."""
+    """Held-out prefill numbers at the runtime configuration; `none` = kept keys only."""
     grid = torch.tensor([alpha, 1.0], dtype=F64, device=ev.Z.device)
     e = _runtime_errs(ev, fit_cut, keep, te, grid)
     k = ev.cuts.index(keep)
@@ -629,8 +627,8 @@ def build_head(
 ) -> HeadBuild:
     """Evaluate the ladder (+ shifted finals, + n_retrieved), choose and shift the cut, fit the map at
     fit_cut = max(final, n_retrieved), fit α and the prefill numbers at the runtime configuration, and
-    assemble the file's tensors and metadata (spec §6.4–§7). The head is written gated off until the
-    decode gate runs (spec §6.7). `identity`: context_len, model, source_cache, built_at.
+    assemble the file's tensors and metadata. The head is written gated off until the
+    decode gate runs. `identity`: context_len, model, source_cache, built_at.
     """
     ladder = list(cfg.ladder)
     keep = cfg.n_retrieved

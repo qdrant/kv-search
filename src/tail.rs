@@ -12,9 +12,9 @@
 //!
 //! A row whose ln Ẑ is −inf (α = 0, n = 0, non-finite) keeps its kept-keys out / lse bit for bit.
 //!
-//! Storage (benchmark `tailm-rust-bench/src/bin/bf16.rs`, variant BF16-all): the 2d+1 columns are
-//! padded to a multiple of 16 and cut into 16-column tiles; a tile is d/2 lines of 64 bytes, line j
-//! holding rows 2j and 2j+1 (2 × 16 bf16), every line 64-byte aligned. bf16 → f32 by `(u as u32) << 16`.
+//! Storage: the 2d+1 columns are padded to a multiple of 16 and cut into 16-column tiles; a tile is
+//! d/2 lines of 64 bytes, line j holding rows 2j and 2j+1 (2 × 16 bf16), every line 64-byte
+//! aligned. bf16 → f32 by `(u as u32) << 16`.
 //! Matmul: 4 rows × 16 columns in registers per tile, tile outer, software prefetch 24 lines ahead.
 
 /// Columns per tile (two AVX2 vectors of f32).
@@ -319,7 +319,7 @@ fn logaddexp(a: f32, b: f32) -> f32 {
 /// ln Φ(x) in f32, torch's `calc_log_ndtr` split (ATen Math.h), t = x/√2:
 ///   x ≥ −1: log1p(−erfc(t)/2);  x < −1, y = −t: y < 4 → ln(erfc(y)/2),
 ///   y ≥ 4 → −y² − ln(2√π·f), f = the Laplace continued fraction of erfc (24 terms, bottom up).
-/// Benchmark port (`tailm-rust-bench/src/kernel.rs`), within 1–2 f32 ulp of torch's f32 log_ndtr.
+/// Within 1–2 f32 ulp of torch's f32 log_ndtr.
 fn log_ndtr(x: f32) -> f32 {
     const Y_CF: f32 = 4.0;
     const CF_TERMS: usize = 24;

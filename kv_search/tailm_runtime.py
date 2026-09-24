@@ -2,9 +2,8 @@
 
 Each active head keeps its `n_retrieved` retrieved keys as today and gets ONE extra pseudo-key for
 every prefill key below them: the stand-in û (linear map of the query) with log mass
-ln α + ln Ẑ (truncated Gaussian, boundary = the weakest kept score). Rule: build spec
-`docs/superpowers/specs/2026-09-23-tailm-build-design.md` §7; integration:
-`docs/superpowers/specs/2026-09-23-tailm-runtime-design.md`. Formulas: `kv_search.tailm` only.
+ln α + ln Ẑ (truncated Gaussian, boundary = the weakest kept score). Rule: `docs/tailm-build.md`
+("How runtime uses a file"). Formulas: `kv_search.tailm` only.
 
 Never imports `kv_search.cache` (cache imports this module).
 """
@@ -115,7 +114,7 @@ def _same_scaling(a: float, b: float) -> bool:
 def _identity_problems(
     meta: dict, *, model: str, context_len: int, head_dim: int, scaling: float
 ) -> list[str]:
-    """Why a file does not belong to this cache / model (runtime spec §7.2); empty when it does."""
+    """Why a file does not belong to this cache / model; empty when it does."""
     bad = []
     if meta.get("model") != model:
         bad.append(f"model {meta.get('model')!r} != {model!r}")
@@ -322,10 +321,10 @@ class TailmRuntime:
         layer: int,
         scaling: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Merge the tail pseudo-key into the kept-keys partition on this layer's active heads
-        (runtime spec §4). `out` [1, q_heads, T, d], `lse` / `boundary` [1, q_heads, T], `q`
-        [1, q_heads, T, d]. Rows of inactive heads come back unchanged; a layer without active
-        heads returns the inputs themselves.
+        """Merge the tail pseudo-key into the kept-keys partition on this layer's active heads.
+        `out` [1, q_heads, T, d], `lse` / `boundary` [1, q_heads, T], `q` [1, q_heads, T, d]. Rows
+        of inactive heads come back unchanged; a layer without active heads returns the inputs
+        themselves.
 
         With `graphs` on CUDA at T = 1 this replays the layer's CUDA graph and returns the graph's
         own output tensors (no clone: that would add two launches per layer at decode). All graphs
@@ -431,7 +430,7 @@ class TailmRuntime:
         return _Graph(graph, static, out, lse)
 
     def describe(self) -> list[str]:
-        """The startup message (runtime spec §7.3): a summary line, then one line per layer."""
+        """The startup message: a summary line, then one line per layer."""
         on = sum(s.active for s in self.status.values())
         lines = [
             f"tailM on {on}/{len(self.status)} heads (n_retrieved {self.n_retrieved}) from {self.folder}"
@@ -451,7 +450,7 @@ def _ratio(a: float, b: float) -> str:
 
 
 class TailmCheck:
-    """In-chat readout (runtime spec §8): per (layer, active KV head), the whole-output error of
+    """In-chat readout: per (layer, active KV head), the whole-output error of
     today's retrieval and of tailM against exact attention over all prefill keys (+ the live keys),
     measured on the same queries."""
 
@@ -528,7 +527,7 @@ class TailmCheck:
         self._acc.clear()
 
     def report(self) -> list[str]:
-        """The readout table (runtime spec §8) for everything observed since the last reset()."""
+        """The readout table for everything observed since the last reset()."""
         acc = self.totals()
         if not acc:
             return ["tailM check: no rows (the tail step did not run)"]
