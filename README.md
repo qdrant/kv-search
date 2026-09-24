@@ -34,6 +34,9 @@ retrievers):
 uv run kv-search prefill --upsert --url localhost --api-key <key>
 ```
 
+`--skip-prefill` builds the edge shards from an already saved cache, without the model;
+`--edge-only layer03_head3,…` rebuilds single shards.
+
 ### Chat
 
 Interactive generation against the prefilled cache:
@@ -45,6 +48,8 @@ uv run kv-search chat -r native -g 512
 - `-r` retriever: `native`, `edge`, `qdrant`, `topk`, `full`
 - `-g` max new tokens, `-n` top-k retrieved per step
 - `--record-indices` saves per-prompt retrieval indices/scores for `analyze`, only works with `-r topk`
+- `--no-retriever.exact` searches the key HNSW graph instead of the exact top-n (`-r native` /
+  `-r edge`; default exact), `--retriever.hnsw-ef` its beam width (default 128)
 
 In the REPL: `/full` switches to full-context generation, `/native` (or any
 retriever name) switches back, `/live` toggles live rendering, `/help` lists
@@ -89,6 +94,19 @@ Building the files takes two steps, once per prefill cache:
    ("not validated"). `--validate-only --validate <dir>` gates existing files later. The files are
    built for one retrieval size (`--n-retrieved`, default 128); run `chat` with the same `-n`,
    otherwise every head stays off. `scripts/build_tailm.py --help` lists the other options.
+
+#### Projection edges
+
+`--proj` loads `<cache>/edge_proj`: edge shards whose key HNSW graph has query-aware projection
+edges, built through a Qdrant fork. They matter only on HNSW search:
+
+```sh
+.venv/bin/kv-search prefill -d niah --skip-prefill --proj          # needs the fork at --url
+.venv/bin/kv-search chat -d niah -r native --proj --no-retriever.exact
+```
+
+On niah this raised HNSW recall@128 from 0.837 to 0.926. Fork, options, recipes and shard checks:
+[`docs/proj-build.md`](docs/proj-build.md).
 
 ### Analyze
 

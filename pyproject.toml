@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.14.2",
     "qdrant-client>=1.18.0",
     "qdrant-edge-py>=0.7.2",
+    "requests>=2.32",
     "rich>=15.0.0",
     "safetensors>=0.7.0",
     "torch>=2.12.0",
