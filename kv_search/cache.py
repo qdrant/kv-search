@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import Annotated, BinaryIO, Literal, Protocol, Unpack
+from typing import TYPE_CHECKING, Annotated, BinaryIO, Literal, Protocol, Unpack
 
 import numpy as np
 import numpy.typing as npt
@@ -37,12 +37,25 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5Attention
 from kv_search._native import NativeEdgeRetriever
 from kv_search.timer import timers
 
+if (
+    TYPE_CHECKING
+):  # annotations only: `import kv_search.cache` stays free of the tailM modules
+    from kv_search.tailm_runtime import TailmCheck, TailmRuntime
+
 
 @dataclass(frozen=True, slots=True)
 class AttentionPartition:
     out: torch.Tensor
     lse: torch.Tensor
     weights: torch.Tensor | None = None
+    # weakest kept scaled score per query [1, heads, q_len] f32: where tailM truncates its tail mass
+    boundary: torch.Tensor | None = None
+    # dtype RetrievalCache.attend casts out / lse to before the live merge (None = keep)
+    cast: torch.dtype | None = None
+    # the tailM result, when the retriever computed it itself (-r native at decode: the Rust tail
+    # fused into the search), f32 [1, heads, q_len, d] / [1, heads, q_len]; attend then skips apply
+    tail_out: torch.Tensor | None = None
+    tail_lse: torch.Tensor | None = None
 
 
 class Retriever(Protocol):
@@ -97,13 +110,25 @@ class TopKRetriever(BaseModel):
         assert layer.keys is not None and layer.values is not None
 
         query = query_states.to(torch.float32)  # [1, 16, q_len, d]
-        keys = _repeat_kv(layer.keys, 4).to(torch.float32)  # [1, 16, k_len, d]
-        values = _repeat_kv(layer.values, 4).to(torch.float32)  # [1, 16, k_len, d]
-
+        kv_heads = layer.keys.shape[1]
+        g = query.shape[1] // kv_heads  # q-heads per KV head
+        # scores per KV head, broadcast over its q-heads: no f32 copy of the repeated cache, and
+        # bit-identical to the repeated form (measured, runtime spec §5.6)
         logits = (
-            torch.matmul(query, keys.transpose(2, 3)) * scaling
+            torch.cat(
+                [
+                    torch.matmul(
+                        query[:, h * g : (h + 1) * g],
+                        layer.keys[:, h : h + 1].to(torch.float32).transpose(2, 3),
+                    )
+                    for h in range(kv_heads)
+                ],
+                dim=1,
+            )
+            * scaling
         )  # [1, 16, q_len, k_len]
         weights, idx = torch.topk(logits, self.n_retrieved, dim=-1)  # [1, 16, q_len, n]
+        del logits
 
         if self.record_indices:
             self._indices.setdefault(layer_idx, []).append(
@@ -113,20 +138,26 @@ class TopKRetriever(BaseModel):
                 weights[0].to("cpu", torch.float32)
             )
 
-        values = values.unsqueeze(2).expand(
-            -1, -1, idx.shape[2], -1, -1
-        )  # [1, 16, q_len, k_len, d]
-        idx = idx.unsqueeze(-1).expand(
-            -1, -1, -1, -1, values.shape[-1]
+        # only the kept values, gathered per KV head from the bf16 cache
+        values = (
+            torch.cat(
+                [
+                    layer.values[0, h][idx[0, h * g : (h + 1) * g]]
+                    for h in range(kv_heads)
+                ],
+                dim=0,
+            )
+            .unsqueeze(0)
+            .to(torch.float32)
         )  # [1, 16, q_len, n, d]
-        values = values.take_along_dim(idx, dim=3)  # [1, 16, q_len, n, d]
 
         lse = torch.logsumexp(weights, dim=-1)  # [1, 16, q_len]
         out = torch.einsum(
             "bhqn,bhqnd->bhqd", torch.softmax(weights, dim=-1), values
         )  # [1, 16, q_len, d]
 
-        return AttentionPartition(out=out, lse=lse)
+        # torch.topk sorts descending: the last kept score is the weakest
+        return AttentionPartition(out=out, lse=lse, boundary=weights[..., -1])
 
     def reset_indices(self) -> None:
         self._indices.clear()
@@ -240,6 +271,9 @@ class QdrantEdgeNativeRetriever(BaseModel):
     n_retrieved: int = 128
     edge_root: str = "cache/edge"
 
+    # the TailmRuntime whose layers are registered with the engine (attach_tailm)
+    _tailm: "TailmRuntime | None" = PrivateAttr(default=None)
+
     @cached_property
     def _engine(self) -> NativeEdgeRetriever:
         return NativeEdgeRetriever(
@@ -253,6 +287,27 @@ class QdrantEdgeNativeRetriever(BaseModel):
             ]
         )
 
+    def attach_tailm(self, runtime: "TailmRuntime") -> None:
+        """Register `runtime`'s active heads with the engine for the Rust decode tail (idempotent;
+        another runtime replaces the registered one)."""
+        if self._tailm is runtime:
+            return
+        self._engine.clear_tailm()
+        self._tailm = None
+        for layer in sorted({layer for layer, _ in runtime.status}):
+            st = runtime.native_state(layer)
+            if st is not None:
+                self._engine.set_tailm(
+                    layer,
+                    st["heads"],
+                    st["packed"],
+                    st["bias"],
+                    st["scale"],
+                    st["log_alpha"],
+                    st["n_keys"],
+                )
+        self._tailm = runtime
+
     def retrieve(
         self,
         query_states: torch.Tensor,
@@ -261,24 +316,52 @@ class QdrantEdgeNativeRetriever(BaseModel):
         scaling: float,
     ) -> AttentionPartition:
         query = query_states[0].to(torch.float32).cpu().numpy()
+        dev = query_states.device
+        rt = self._tailm
+        if (
+            rt is not None
+            and query_states.shape[2]
+            == 1  # decode; the prompt pass (T > 1) keeps the GPU tail
+            and rt.covers(layer_idx, self.n_retrieved)
+            # folded into the registered matrices; another scaling falls through to
+            # RetrievalCache.attend, whose TailmRuntime.apply refuses it
+            and rt.same_scaling(scaling)
+        ):
+            with timers.qdrant_retrieve:
+                out, lse, boundary, tail_out, tail_lse = self._engine.retrieve_tail(
+                    layer_idx,
+                    query,
+                    limit=self.n_retrieved,
+                    scaling=scaling,
+                )
+            return AttentionPartition(
+                out=_from_numpy(out, dev),
+                lse=_from_numpy(lse, dev),
+                boundary=_from_numpy(boundary, dev),
+                cast=query_states.dtype,
+                tail_out=_from_numpy(tail_out, dev),
+                tail_lse=_from_numpy(tail_lse, dev),
+            )
         with timers.qdrant_retrieve:
-            out, lse = self._engine.retrieve(
+            out, lse, boundary = self._engine.retrieve(
                 layer_idx,
                 query,
                 limit=self.n_retrieved,
                 scaling=scaling,
             )
-        out = (
-            torch.from_numpy(out)
-            .unsqueeze(0)
-            .to(query_states.device, query_states.dtype)
+        # f32 until RetrievalCache.attend: tailM merges on the f32 lse, then attend casts to
+        # `cast` -- the cast this method used to do itself (runtime spec §5.3)
+        return AttentionPartition(
+            out=_from_numpy(out, dev),
+            lse=_from_numpy(lse, dev),
+            boundary=_from_numpy(boundary, dev),
+            cast=query_states.dtype,
         )
-        lse = (
-            torch.from_numpy(lse)
-            .unsqueeze(0)
-            .to(query_states.device, query_states.dtype)
-        )
-        return AttentionPartition(out=out, lse=lse)
+
+
+def _from_numpy(a: npt.NDArray[np.float32], device: torch.device) -> torch.Tensor:
+    """An extension array [heads, ...] as a [1, heads, ...] tensor on `device`, dtype kept."""
+    return torch.from_numpy(a).unsqueeze(0).to(device)
 
 
 class QdrantEdgeRetriever(BaseModel):
@@ -376,15 +459,22 @@ RetrieverConfig = Annotated[
 
 
 class RetrievalCache(DynamicCache):
+
     def __init__(
         self,
         retriever: Retriever,
         prefill: DynamicCache,
         config: PreTrainedConfig | None = None,
+        tailm: "TailmRuntime | None" = None,
+        check: "TailmCheck | None" = None,
     ):
         super().__init__(config=config)
         self.retriever = retriever
         self.prefill = prefill
+        # tail correction for the retrieved partition (runtime spec); None = today's path
+        self.tailm = tailm
+        # --tailm-check readout; observes only forwards where the tail step ran
+        self.check = check
         self._restore_state()
 
     def _restore_state(self):
@@ -418,6 +508,86 @@ class RetrievalCache(DynamicCache):
     def reset(self):
         super().reset()
         self._restore_state()
+
+    def attend(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        scaling: float,
+    ) -> torch.Tensor:
+        """Retrieval attention of one full-attention layer: the retriever's prefill partition
+        (plus the tailM pseudo-key on active heads), LSE-merged with the live (decode-generated)
+        keys. Returns [1, q_heads, q_len, d]; the caller casts and transposes (runtime spec §5.3, §6).
+        """
+        if self.tailm is not None and hasattr(self.retriever, "attach_tailm"):
+            # -r native: the Rust decode tail; idempotent, covers a /native switch in the REPL
+            self.retriever.attach_tailm(self.tailm)
+        retrieved = self.retriever.retrieve(
+            query_states, layer_idx, prefill=self.prefill, scaling=scaling
+        )
+        out, lse = retrieved.out, retrieved.lse
+        tail_ran = (
+            self.tailm is not None
+            and retrieved.boundary is not None
+            # the files apply only at exactly their retrieval size; chat always passes the startup
+            # retriever's n_retrieved, so this guards other callers that build retrievers themselves
+            and self.tailm.covers(
+                layer_idx, getattr(self.retriever, "n_retrieved", None)
+            )
+        )
+        if tail_ran and retrieved.tail_out is not None:
+            out, lse = (
+                retrieved.tail_out,
+                retrieved.tail_lse,
+            )  # computed by the retriever (-r native)
+        elif tail_ran:
+            out, lse = self.tailm.apply(
+                out, lse, retrieved.boundary, query_states, layer_idx, scaling
+            )
+        tail_out, tail_lse = out, lse  # pre-cast, for the readout
+        # after the tail: tailM merges on the retriever's f32 lse
+        if retrieved.cast is not None:
+            out, lse = out.to(retrieved.cast), lse.to(retrieved.cast)
+
+        live_mask = _causal_mask(
+            query_states.shape[2],
+            key_states.shape[2],
+            query_states.dtype,
+            query_states.device,
+        )
+        should_record_scores = (
+            isinstance(self.retriever, TopKRetriever) and self.retriever.record_indices
+        )
+        live = _partition_attend(
+            query_states,
+            key_states,
+            value_states,
+            scaling,
+            live_mask,
+            return_weights=should_record_scores,
+        )
+        if should_record_scores and live.weights is not None:
+            self.retriever.record_dynamic_scores(layer_idx, live.weights)
+
+        if tail_ran and self.check is not None:
+            layer = self.prefill.layers[layer_idx]
+            self.check.observe(
+                layer_idx,
+                query_states,
+                retrieved.out,
+                retrieved.lse,
+                tail_out,
+                tail_lse,
+                live.out,
+                live.lse,
+                layer.keys,
+                layer.values,
+                scaling,
+            )
+
+        return _merge_partitions(live.out, live.lse, out, lse)
 
     def update(
         self,
@@ -734,30 +904,8 @@ def _qwen_3_5_forward(
         past_key_values.retriever, FullContextRetriever
     )
     if isinstance(past_key_values, RetrievalCache) and not is_full_context:
-        # NOTE: at least part of this should be happening in the retriever
-        retrieved = past_key_values.retriever.retrieve(
-            query_states,
-            self.layer_idx,
-            prefill=past_key_values.prefill,
-            scaling=self.scaling,
-        )
-
-        live_mask = _causal_mask(
-            query_states.shape[2],
-            key_states.shape[2],
-            query_states.dtype,
-            query_states.device,
-        )
-        should_record_scores = isinstance(past_key_values.retriever, TopKRetriever) and past_key_values.retriever.record_indices
-        live = _partition_attend(
-            query_states, key_states, value_states, self.scaling, live_mask, return_weights=should_record_scores
-        )
-
-        if should_record_scores and live.weights is not None:
-            past_key_values.retriever.record_dynamic_scores(self.layer_idx, live.weights)
-
-        attn_output = _merge_partitions(
-            live.out, live.lse, retrieved.out, retrieved.lse
+        attn_output = past_key_values.attend(
+            query_states, key_states, value_states, self.layer_idx, self.scaling
         )
         attn_output = attn_output.to(query_states.dtype).transpose(1, 2).contiguous()
         attn_weights = None

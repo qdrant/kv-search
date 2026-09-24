@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.14.2",
     "qdrant-client>=1.18.0",
     "qdrant-edge-py>=0.7.2",
+    "rich>=15.0.0",
     "safetensors>=0.7.0",
     "torch>=2.12.0",
     "torchvision>=0.27.0",
@@ -36,6 +37,9 @@ extra-build-dependencies = { flash-attn = ["ninja"], causal-conv1d = ["ninja"] }
 # This is somewhat nvidia spark specific but whatever
 extra-build-variables = { flash-attn = { MAX_JOBS = "16", FLASH_ATTN_CUDA_ARCHS = "120" }, causal-conv1d = { MAX_JOBS = "16" } }
 
+# 3090 build
+# extra-build-variables = { flash-attn = { MAX_JOBS = "5", FLASH_ATTN_CUDA_ARCHS = "86" }, causal-conv1d = { MAX_JOBS = "16" } }
+
 [tool.maturin]
 module-name = "kv_search._native"
 
@@ -45,4 +49,5 @@ dev = [
     "jupytext>=1.19.5",
     "maturin>=1.14.1",
     "ninja>=1.13.0",
+    "pytest>=9.1.1",
 ]

@@ -12,6 +12,7 @@ numpy = "0.29.0"
 pyo3 = { version = "0.29.0", features = ["abi3-py313"] }
 qdrant-edge = { package = "edge", git = "https://github.com/qdrant/qdrant.git", rev = "2ef887bae1e840b7b3bceb9b94b23589eaff4693" }
 rayon = "1.12.0"
+libm = "0.2.16"  # erfcf for the tailM tail's log_ndtr (src/tail.rs)
 
 [profile.release]
 lto = true
