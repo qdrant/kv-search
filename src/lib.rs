@@ -48,6 +48,9 @@ mod _native {
     #[pyclass]
     struct NativeEdgeRetriever {
         shards: HashMap<(usize, usize), EdgeShard>,
+        // true: exact top-n (full scan); false: HNSW search with `hnsw_ef` (raised to the limit)
+        exact: bool,
+        hnsw_ef: usize,
         // tailM decode tail per (layer, KV head), registered by set_tailm
         tails: HashMap<(usize, usize), HeadTail>,
         kernel: Kernel,
@@ -73,7 +76,8 @@ mod _native {
                 .collect()
         }
 
-        /// Exact search of one KV head's query rows `x` [rows, d], then the kept keys' softmax merge.
+        /// Search of one KV head's query rows `x` [rows, d] (exact, or HNSW with `hnsw_ef`), then
+        /// the kept keys' softmax merge.
         fn search_merge(
             &self,
             layer_idx: usize,
@@ -97,7 +101,8 @@ mod _native {
                             limit,
                             offset: 0,
                             params: Some(SearchParams {
-                                exact: true,
+                                exact: self.exact,
+                                hnsw_ef: (!self.exact).then_some(self.hnsw_ef),
                                 ..Default::default()
                             }),
                             with_vector: WithVector::Selector(vec!["value".to_string()]),
@@ -119,7 +124,9 @@ mod _native {
                         .iter()
                         .map(|p| p.score * scaling)
                         .fold(f32::NEG_INFINITY, f32::max);
-                    // weakest kept logit: where tailM truncates its Gaussian tail mass
+                    // weakest kept logit: where tailM truncates its Gaussian tail mass. Under HNSW
+                    // it is the weakest *retrieved* logit, not the exact top-n boundary the
+                    // tailM gate was measured on
                     let boundary = points
                         .iter()
                         .map(|p| p.score * scaling)
@@ -186,7 +193,12 @@ mod _native {
     #[pymethods]
     impl NativeEdgeRetriever {
         #[new]
-        fn new(shards: Vec<((usize, usize), String)>) -> PyResult<Self> {
+        #[pyo3(signature = (shards, exact = true, hnsw_ef = 128))]
+        fn new(
+            shards: Vec<((usize, usize), String)>,
+            exact: bool,
+            hnsw_ef: usize,
+        ) -> PyResult<Self> {
             let shards = shards
                 .into_iter()
                 .map(|(k, p)| {
@@ -202,9 +214,21 @@ mod _native {
 
             Ok(Self {
                 shards,
+                exact,
+                hnsw_ef,
                 tails: HashMap::new(),
                 kernel: Kernel::detect(),
             })
+        }
+
+        /// `"exact"` or `"hnsw ef N"`.
+        #[getter]
+        fn search_mode(&self) -> String {
+            if self.exact {
+                "exact".to_string()
+            } else {
+                format!("hnsw ef {}", self.hnsw_ef)
+            }
         }
 
         fn retrieve<'py>(

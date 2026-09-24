@@ -5,7 +5,17 @@ def tailm_kernel() -> str:
     "neon" (aarch64) or "portable"."""
 
 class NativeEdgeRetriever:
-    def __init__(self, shards: list[tuple[tuple[int, int], str]]): ...
+    def __init__(
+        self,
+        shards: list[tuple[tuple[int, int], str]],
+        exact: bool = True,
+        hnsw_ef: int = 128,
+    ):
+        """Load the shards. `exact`: full-scan top-n; otherwise HNSW search with `hnsw_ef`
+        (raised to the limit by qdrant-edge)."""
+    @property
+    def search_mode(self) -> str:
+        """`"exact"` or `"hnsw ef N"`."""
     def retrieve(
         self,
         layer_idx: int,

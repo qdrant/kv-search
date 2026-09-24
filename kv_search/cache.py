@@ -270,6 +270,10 @@ class QdrantEdgeNativeRetriever(BaseModel):
     type: Literal["native"] = "native"
     n_retrieved: int = 128
     edge_root: str = "cache/edge"
+    # exact top-n (tailM's gate was measured on it); false: HNSW search of the key graph
+    exact: bool = True
+    # HNSW beam width when not exact (qdrant-edge raises it to n_retrieved)
+    hnsw_ef: int = 128
 
     # the TailmRuntime whose layers are registered with the engine (attach_tailm)
     _tailm: "TailmRuntime | None" = PrivateAttr(default=None)
@@ -284,7 +288,9 @@ class QdrantEdgeNativeRetriever(BaseModel):
                 )
                 for layer_idx in range(3, 32, 4)
                 for head_idx in range(4)
-            ]
+            ],
+            exact=self.exact,
+            hnsw_ef=self.hnsw_ef,
         )
 
     def attach_tailm(self, runtime: "TailmRuntime") -> None:
@@ -368,6 +374,9 @@ class QdrantEdgeRetriever(BaseModel):
     type: Literal["edge"] = "edge"
     n_retrieved: int = 128
     edge_root: str = "cache/edge"
+    # as QdrantEdgeNativeRetriever
+    exact: bool = True
+    hnsw_ef: int = 128
 
     _shards: dict[tuple[int, int], edge.EdgeShard] = PrivateAttr(default_factory=dict)
 
@@ -390,7 +399,9 @@ class QdrantEdgeRetriever(BaseModel):
                         query=query_states[query_idx + i, token_idx],
                         using="key",
                     ),
-                    params=edge.SearchParams(exact=True),
+                    params=edge.SearchParams(
+                        exact=self.exact, hnsw_ef=None if self.exact else self.hnsw_ef
+                    ),
                     with_payload=False,
                     with_vector=["value"],
                     limit=self.n_retrieved,
