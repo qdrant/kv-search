@@ -512,9 +512,9 @@ def _print_plain(lines: list[str]) -> None:
 
 
 class TailmFlags(BaseModel):
-    """Opt-in tail correction (tailM) for retrieval attention
-    (docs/superpowers/specs/2026-09-23-tailm-runtime-design.md). A subcommand that builds a
-    RetrievalCache gets it by inheriting these flags and calling the methods below."""
+    """Opt-in tail correction (tailM) for retrieval attention (docs/tailm-build.md). A
+    subcommand that builds a RetrievalCache gets it by inheriting these flags and calling the
+    methods below."""
 
     # add back the dropped prefill keys' softmax mass on the heads scripts/build_tailm.py gated on
     tailm: bool = False
@@ -524,7 +524,7 @@ class TailmFlags(BaseModel):
     tailm_check: bool = False
 
     def tailm_preflight(self, model_name: str, retriever_type: str) -> None:
-        """Flag checks that need no model or cache (runtime spec §7.4)."""
+        """Flag checks that need no model or cache."""
         if self.tailm_check and not self.tailm:
             raise SystemExit("error: --tailm-check needs --tailm")
         if not self.tailm:
@@ -552,7 +552,7 @@ class TailmFlags(BaseModel):
         n_retrieved: int,
         retriever_type: str | None = None,
     ) -> tuple[TailmRuntime | None, TailmCheck | None]:
-        """Load the tailM files, print the startup message (runtime spec §7.2, §7.3); on -r native
+        """Load the tailM files, print the startup message; on -r native
         it also names the Rust decode tail's kernel."""
         if not self.tailm:
             return None, None

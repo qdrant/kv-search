@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Build tailM files from a prefill cache: per (layer, KV head) the linear tail map (fitted at a depth
 chosen from an error target ε), the key moments and α, for a runtime that keeps `n_retrieved` keys;
-each head is gated on recorded decode sessions against those kept keys alone (spec revision 2).
+each head is gated on recorded decode sessions against those kept keys alone.
 
-  .venv/bin/python scripts/build_tailm.py --cache cache/qdrant/1M/qwen3_5 --validate ../kv-search/replay-data
+  .venv/bin/python scripts/build_tailm.py --cache cache/qdrant/1M/qwen3_5 --validate <sessions-dir>
   .venv/bin/python scripts/build_tailm.py --cache cache/qdrant/1M/qwen3_5 --cells L15H3 --eps 0.08 --cut-shift 10%
   .venv/bin/python scripts/build_tailm.py --cache cache/qdrant/1M/qwen3_5 --validate-only \\
-      --validate ../kv-search/replay-data --cells L15H3
+      --validate <sessions-dir> --cells L15H3
   .venv/bin/python scripts/build_tailm.py --cache cache/qdrant/1M/qwen3_5 --summary-only
 
 Without --validate every head is written gated off; --validate-only gates the stored files later.
 Negative percentage shifts need an equals sign: --cut-shift=-10%.
-Design: docs/superpowers/specs/2026-09-23-tailm-build-design.md.
+Usage and options: docs/tailm-build.md.
 """
 
 import argparse
@@ -122,7 +122,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--seed",
         type=int,
         default=3,
-        help="query sampling seed (3 = the research recipe)",
+        help="query sampling seed",
     )
     p.add_argument(
         "--ridge",
@@ -298,7 +298,7 @@ def print_summary(
     out: Path,
     validate_dir: Path | None,
 ) -> None:
-    """The end-of-run summary (spec §9): one row per head, per-layer totals, flags, next steps."""
+    """The end-of-run summary: one row per head, per-layer totals, flags, next steps."""
     t = Table(
         box=box.SIMPLE, title=escape(f"tailM heads in {out}"), title_justify="left"
     )
@@ -394,7 +394,7 @@ def print_summary(
         sess = str(validate_dir) if validate_dir else "<sessions-dir>"
         con.print(
             "[yellow]note:[/] not validated heads stay off: only recorded decode queries can gate them (the map "
-            "fits decode queries worse than prefill ones, FINDINGS §13.7). Activate them with:"
+            "fits decode queries worse than prefill ones). Activate them with:"
         )
         con.print(
             escape(
@@ -406,7 +406,7 @@ def print_summary(
 
 
 def export_heads(con: Console, heads: dict[Cell, TailmHead], root: Path) -> None:
-    """kv-replay's layout for every gated-on head (spec §7.1), in every mode."""
+    """kv-replay's layout for every gated-on head, in every mode."""
     on = [c for c in sorted(heads) if heads[c].gate_pass]
     for c in on:
         export_replay(heads[c], root)
@@ -437,7 +437,7 @@ def write_json(path: Path, heads: dict, peaks: list, cache: Path, out: Path) -> 
 
 
 def with_gate(meta: dict, v: dict, worse_tol: float, p99_tol: float) -> dict:
-    """`meta` with the decode numbers and the gate decision of spec §6.7."""
+    """`meta` with the decode numbers and the gate decision."""
     g = gate(v, worse_tol=worse_tol, p99_tol=p99_tol)
     return {**meta, "decode": v, "gate": g, "gate_pass": g["pass"]}
 
@@ -634,7 +634,7 @@ def main(argv: list[str] | None = None) -> int:
     peaks: list[tuple[str, float]] = []
     if not sessions:
         prog.warn(
-            "no --validate sessions: every head is written gated off until --validate-only gates it (spec §6.7)"
+            "no --validate sessions: every head is written gated off until --validate-only gates it"
         )
     try:
         for bi, batch in enumerate(batches, 1):

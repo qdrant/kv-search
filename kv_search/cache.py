@@ -113,7 +113,7 @@ class TopKRetriever(BaseModel):
         kv_heads = layer.keys.shape[1]
         g = query.shape[1] // kv_heads  # q-heads per KV head
         # scores per KV head, broadcast over its q-heads: no f32 copy of the repeated cache, and
-        # bit-identical to the repeated form (measured, runtime spec §5.6)
+        # bit-identical to the repeated form (measured)
         logits = (
             torch.cat(
                 [
@@ -350,7 +350,7 @@ class QdrantEdgeNativeRetriever(BaseModel):
                 scaling=scaling,
             )
         # f32 until RetrievalCache.attend: tailM merges on the f32 lse, then attend casts to
-        # `cast` -- the cast this method used to do itself (runtime spec §5.3)
+        # `cast` -- the cast this method used to do itself
         return AttentionPartition(
             out=_from_numpy(out, dev),
             lse=_from_numpy(lse, dev),
@@ -471,7 +471,7 @@ class RetrievalCache(DynamicCache):
         super().__init__(config=config)
         self.retriever = retriever
         self.prefill = prefill
-        # tail correction for the retrieved partition (runtime spec); None = today's path
+        # tail correction for the retrieved partition; None = today's path
         self.tailm = tailm
         # --tailm-check readout; observes only forwards where the tail step ran
         self.check = check
@@ -519,7 +519,7 @@ class RetrievalCache(DynamicCache):
     ) -> torch.Tensor:
         """Retrieval attention of one full-attention layer: the retriever's prefill partition
         (plus the tailM pseudo-key on active heads), LSE-merged with the live (decode-generated)
-        keys. Returns [1, q_heads, q_len, d]; the caller casts and transposes (runtime spec §5.3, §6).
+        keys. Returns [1, q_heads, q_len, d]; the caller casts and transposes.
         """
         if self.tailm is not None and hasattr(self.retriever, "attach_tailm"):
             # -r native: the Rust decode tail; idempotent, covers a /native switch in the REPL

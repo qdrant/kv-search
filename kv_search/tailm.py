@@ -6,8 +6,7 @@ estimate Ẑ of the dropped keys' softmax mass (keys ~ N(μ, Σ), truncated at t
 
     out = (N_top + Ẑ·û) / (D_top + Ẑ)
 
-Research log: research branch `FINDINGS_TAIL_CORRECTION.md` §6, §13. Build: `scripts/build_tailm.py`.
-Design: `docs/superpowers/specs/2026-09-23-tailm-build-design.md`.
+Build: `scripts/build_tailm.py` (usage: `docs/tailm-build.md`).
 
 No model imports here (transformers only lazily in `rope_inv_freq`, for non-default RoPE).
 """
@@ -25,7 +24,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-VERSION = 2  # 2: runtime keeps `n_retrieved` keys, map fitted at `fit_cut`, α applied (spec revision 2)
+VERSION = 2  # 2: runtime keeps `n_retrieved` keys, map fitted at `fit_cut`, α applied
 TENSORS = ("weight", "bias", "mean", "cov")
 F64 = torch.float64
 
@@ -52,19 +51,19 @@ class TailmHead:
 
     @property
     def n_retrieved(self) -> int:
-        """Exact keys runtime keeps; the file applies only at exactly this retrieval size (spec §7)."""
+        """Exact keys runtime keeps; the file applies only at exactly this retrieval size."""
         return int(self.meta["n_retrieved"])
 
     @property
     def fit_cut(self) -> int:
         """Depth the map was fitted at (its tail starts below this rank). Build-only: runtime keeps
-        `n_retrieved` keys and covers everything below them with the Gaussian mass (spec §6.5).
+        `n_retrieved` keys and covers everything below them with the Gaussian mass.
         """
         return int(self.meta["fit_cut"])
 
     @property
     def alpha(self) -> float:
-        """Mass multiplier on Ẑ, applied at runtime (spec §6.6)."""
+        """Mass multiplier on Ẑ, applied at runtime."""
         return float(self.meta["alpha"])
 
     @property
@@ -73,7 +72,7 @@ class TailmHead:
 
     @property
     def gate_pass(self) -> bool:
-        """False: runtime ignores this file and uses the global `n_retrieved` (spec §7)."""
+        """False: runtime ignores this file and uses the global `n_retrieved`."""
         return bool(self.meta["gate_pass"])
 
 
@@ -117,8 +116,7 @@ def load_dir(out: Path) -> dict[tuple[int, int], TailmHead]:
 
 
 def export_replay(head: TailmHead, root: Path) -> None:
-    """kv-replay's `--tail` / `--moments` layout (research `make_tail.py --model linear` /
-    `make_moments.py`), byte-identical to the safetensors tensors (spec §7.1)."""
+    """kv-replay's `--tail` / `--moments` layout, byte-identical to the safetensors tensors."""
     name = f"layer{head.layer:02d}_head{head.head}"
     m = head.meta
     tail, mom = root / "tailvecs_linear" / name, root / "moments" / name
@@ -156,12 +154,12 @@ def export_replay(head: TailmHead, root: Path) -> None:
 
 
 def unit(x: torch.Tensor) -> torch.Tensor:
-    """Normalise the last axis; norms floored at 1e-30 (the research code's `unit`)."""
+    """Normalise the last axis; norms floored at 1e-30."""
     return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-30)
 
 
 def rel_err(out: torch.Tensor, exact: torch.Tensor) -> torch.Tensor:
-    """Relative L2 error per row, ‖out − exact‖ / ‖exact‖ (spec §6.3)."""
+    """Relative L2 error per row, ‖out − exact‖ / ‖exact‖."""
     return (out - exact).norm(dim=-1) / exact.norm(dim=-1)
 
 
@@ -223,8 +221,8 @@ def gaussian_tail_mass_finish(
     dtype: torch.dtype = F64,
 ) -> torch.Tensor:
     """ln Ẑ of `gaussian_tail_mass` from its products μ_s = scaling·q·μ and σ_s² = scaling²·qᵀΣq
-    (same shape; `boundary` broadcasts against them), in `dtype`. Edge cases exactly as kv-replay
-    `attn::gaussian_tail_partition`: σ_s = sqrt(max(σ_s², 0)); σ_s = 0 → no truncation factor;
+    (same shape; `boundary` broadcasts against them), in `dtype`. Edge cases:
+    σ_s = sqrt(max(σ_s², 0)); σ_s = 0 → no truncation factor;
     n_keys == 0 or a non-finite result → −inf (empty tail)."""
     mu_s, var = mu_s.to(dtype), var.to(dtype)
     boundary = torch.as_tensor(boundary, dtype=dtype, device=mu_s.device)
@@ -258,7 +256,6 @@ def merge_lse(
 
 
 # ------------------------------------------------------------------ prefill queries + RoPE
-# Ported from the research branch `kv_search/proj.py`.
 
 
 def _query_file_layout(path: Path) -> tuple[int, list[int]]:

@@ -1,11 +1,11 @@
-"""Optional check of built tailM heads against recorded decode sessions (spec §8).
+"""Optional check of built tailM heads against recorded decode sessions.
 
-A session file (research `replay-data/*.safetensors`) holds, per full-attention layer, the decode
+A session file (`*.safetensors`) holds, per full-attention layer, the decode
 `queries` [T, q_heads, d] (post-RoPE), the decode-generated `keys` / `values` [T, kv_heads, d] and
 the model's `attn_out` [T, q_heads, d] (before the output gate and o_proj). Row t attends to the
-whole prefill plus decode rows 0..t. The check runs the runtime configuration (spec §6.5: exact
+whole prefill plus decode rows 0..t. The check runs the runtime configuration (exact
 top-`n_retrieved`, Gaussian below the weakest kept score, α) and compares it with the kept keys alone;
-`gate` turns that into the per-head decision (spec §6.7). It uses the exact top-`n_retrieved`, so it
+`gate` turns that into the per-head decision. It uses the exact top-`n_retrieved`, so it
 measures how the map and the mass hold up on real decode queries, not what an HNSW search misses.
 """
 
@@ -69,7 +69,7 @@ def check_sessions(
     tier_size: str | None,
     layers: list[int],
 ) -> None:
-    """Refuse sessions recorded on a different cache/model (spec §8)."""
+    """Refuse sessions recorded on a different cache/model."""
     for s in sessions:
         md, problems = s.meta, []
         if md.get("context_len") != str(context_len):
@@ -162,7 +162,7 @@ def validate_batch(
     on_chunk: Callable[[int, int], None] | None = None,
 ) -> dict[tuple[int, int], dict]:
     """Second pass over the resident K/V [H, n_keys, d] of `cells`, with the decode queries in
-    blocks of `block` rows, at each head's runtime configuration (spec §6.5, §8)."""
+    blocks of `block` rows, at each head's runtime configuration."""
     dev = K.device
     rows = [decode_rows(sessions, L, h, group, scaling, dev) for L, h in cells]
     R = rows[0].q.shape[0]
@@ -240,7 +240,7 @@ def validate_batch(
 
 
 def gate(v: dict, *, worse_tol: float, p99_tol: float) -> dict:
-    """The per-head decision from `validate_batch` numbers (spec §6.7): on only if the sanity check
+    """The per-head decision from `validate_batch` numbers: on only if the sanity check
     passes, at most `worse_tol` of the decode rows are worse than the kept keys alone, and the p99 of
     err(tailM)/err(kept only) over those rows is at most `p99_tol`. A gated-off head runs today's path.
     """
