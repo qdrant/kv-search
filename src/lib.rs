@@ -48,9 +48,10 @@ mod _native {
     #[pyclass]
     struct NativeEdgeRetriever {
         shards: HashMap<(usize, usize), EdgeShard>,
-        // true: exact top-n (full scan); false: HNSW search with `hnsw_ef` (raised to the limit)
+        // true: exact top-n (full scan); false: HNSW search with `hnsw_ef` (None -> qdrant-edge's
+        // own default, raised to the limit)
         exact: bool,
-        hnsw_ef: usize,
+        hnsw_ef: Option<usize>,
         // tailM decode tail per (layer, KV head), registered by set_tailm
         tails: HashMap<(usize, usize), HeadTail>,
         kernel: Kernel,
@@ -102,7 +103,7 @@ mod _native {
                             offset: 0,
                             params: Some(SearchParams {
                                 exact: self.exact,
-                                hnsw_ef: (!self.exact).then_some(self.hnsw_ef),
+                                hnsw_ef: if self.exact { None } else { self.hnsw_ef },
                                 ..Default::default()
                             }),
                             with_vector: WithVector::Selector(vec!["value".to_string()]),
@@ -193,11 +194,11 @@ mod _native {
     #[pymethods]
     impl NativeEdgeRetriever {
         #[new]
-        #[pyo3(signature = (shards, exact = true, hnsw_ef = 128))]
+        #[pyo3(signature = (shards, exact = true, hnsw_ef = None))]
         fn new(
             shards: Vec<((usize, usize), String)>,
             exact: bool,
-            hnsw_ef: usize,
+            hnsw_ef: Option<usize>,
         ) -> PyResult<Self> {
             let shards = shards
                 .into_iter()
@@ -221,13 +222,16 @@ mod _native {
             })
         }
 
-        /// `"exact"` or `"hnsw ef N"`.
+        /// `"exact"`, `"hnsw ef N"`, or `"hnsw ef default"` when unset.
         #[getter]
         fn search_mode(&self) -> String {
             if self.exact {
                 "exact".to_string()
             } else {
-                format!("hnsw ef {}", self.hnsw_ef)
+                match self.hnsw_ef {
+                    Some(ef) => format!("hnsw ef {ef}"),
+                    None => "hnsw ef default".to_string(),
+                }
             }
         }
 

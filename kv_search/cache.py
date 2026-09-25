@@ -59,6 +59,9 @@ class AttentionPartition:
 
 
 class Retriever(Protocol):
+    @property
+    def type(self) -> str: ...
+
     def retrieve(
         self,
         query_states: torch.Tensor,
@@ -272,8 +275,9 @@ class QdrantEdgeNativeRetriever(BaseModel):
     edge_root: str = "cache/edge"
     # exact top-n (tailM's gate was measured on it); false: HNSW search of the key graph
     exact: bool = True
-    # HNSW beam width when not exact (qdrant-edge raises it to n_retrieved)
-    hnsw_ef: int = 128
+    # HNSW beam width when not exact; None lets qdrant-edge use its own default
+    # (ef_construct, raised to n_retrieved when smaller)
+    hnsw_ef: int | None = None
 
     # the TailmRuntime whose layers are registered with the engine (attach_tailm)
     _tailm: "TailmRuntime | None" = PrivateAttr(default=None)
@@ -376,7 +380,7 @@ class QdrantEdgeRetriever(BaseModel):
     edge_root: str = "cache/edge"
     # as QdrantEdgeNativeRetriever
     exact: bool = True
-    hnsw_ef: int = 128
+    hnsw_ef: int | None = None
 
     _shards: dict[tuple[int, int], edge.EdgeShard] = PrivateAttr(default_factory=dict)
 
