@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field
 from pydantic_settings import CliApp, CliSubCommand
 from rich.console import Console
 from rich.progress import track
+from rich.table import Table
 from safetensors import SafetensorError
 
 # auto_docstring emits [ERROR] lines via print() at class-definition time
@@ -82,7 +83,15 @@ from kv_search.cache import (
     load_cache,
     save_cache,
 )
-from kv_search.data import Datasets, Message, load_dataset
+from kv_search.data import (
+    Datasets,
+    EvalExample,
+    Message,
+    generate_niah_examples,
+    generate_qa_examples,
+    load_dataset,
+)
+from kv_search.eval import EvalRow, GenerationResult, score_row
 from kv_search.tailm import VERSION as TAILM_VERSION
 from kv_search.tailm_runtime import TailmCheck, TailmRuntime
 from kv_search.timer import timers
@@ -193,12 +202,12 @@ def _load_model(
     config = load_model_config(model_name, context_tokens)
 
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
-    load_kwargs = dict(
-        config=config,
-        attn_implementation=_ATTN_IMPL,
-        dtype=torch.bfloat16,
-        device_map="cuda",
-    )
+    load_kwargs = {
+        "config": config,
+        "attn_implementation": _ATTN_IMPL,
+        "dtype": torch.bfloat16,
+        "device_map": "cuda",
+    }
     if model_name in IS_MULTIMODAL:
         model: ModelType = AutoModelForMultimodalLM.from_pretrained(
             model_name, **load_kwargs
@@ -221,19 +230,11 @@ def _cache_dir(dataset_name: Datasets, qdrant_size: str, model_type: str) -> Pat
 
 @timers.prefill_gen
 def _do_prefill(
-    messages: Message,
+    inputs: BatchEncoding,
     model: ModelType,
-    processor: ProcessorType,
-    past_key_values: RecordingCache,
+    past_key_values: DynamicCache,
     batch_size: int = 4096,
 ):
-    inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
-        messages.prefill,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    )  # ty:ignore[invalid-assignment]
     input_chunks = torch.split(inputs["input_ids"], batch_size, -1)
     attention_masks = torch.split(inputs["attention_mask"], batch_size, -1)
     if "mm_token_type_ids" in inputs:
@@ -403,7 +404,10 @@ def _upsert(
                 vectors_config={
                     "key": VectorParamsDiff(hnsw_config=HnswConfigDiff(m=16))
                 },
-                optimizers_config=OptimizersConfigDiff(indexing_threshold=20000),
+                # threshold below the single segment's size so the graph builds
+                optimizers_config=OptimizersConfigDiff(
+                    indexing_threshold=1000, default_segment_number=1
+                ),
             )
         else:
             assert queries_dir is not None
@@ -751,7 +755,14 @@ class CmdPrefill(ProjFlags):
                 qdrant_size=self.qdrant_size,
             )
 
-            _do_prefill(messages, model, processor, cache, self.prefill_batch_size)
+            inputs: BatchEncoding = processor.apply_chat_template(
+                messages.prefill,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )  # ty:ignore[invalid-assignment]
+            _do_prefill(inputs, model, cache, self.prefill_batch_size)
 
             save_cache(
                 cache,
@@ -1032,7 +1043,7 @@ class CmdChat(TailmFlags, ProjDir):
                 elif cmd in _RETRIEVERS:
                     if cmd not in instances:
                         r = _RETRIEVERS[cmd]()
-                        if hasattr(r, "n_retrieved"):
+                        if not isinstance(r, FullContextRetriever):
                             r.n_retrieved = n_retrieved
                         for k, v in search.items():
                             if hasattr(r, k):
@@ -1129,6 +1140,280 @@ class CmdAnalyze(BaseModel):
         data.analyze()
 
 
+def _encode_eval(
+    processor: ProcessorType, ex: EvalExample
+) -> tuple[BatchEncoding, int]:
+    # render once and split at the final user turn, so prefill is a true prefix
+    # of the decode input (rendering prefill separately drifts on Qwen's per-turn
+    # think handling)
+    enc: BatchEncoding = processor.apply_chat_template(
+        ex.prefill + ex.query,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        enable_thinking=False,
+    )  # ty:ignore[invalid-assignment]
+    ids = enc["input_ids"][0].tolist()
+    im_start = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
+    user_tok = processor.tokenizer.encode("user", add_special_tokens=False)[0]
+    starts = [
+        i for i in range(len(ids) - 1) if ids[i] == im_start and ids[i + 1] == user_tok
+    ]
+    if not starts:
+        raise RuntimeError("could not locate final user turn in render")
+    return enc, starts[-1]
+
+
+def _slice_inputs(enc: BatchEncoding, end: int) -> BatchEncoding:
+    out = {
+        "input_ids": enc["input_ids"][:, :end],
+        "attention_mask": enc["attention_mask"][:, :end],
+    }
+    if "mm_token_type_ids" in enc:
+        out["mm_token_type_ids"] = enc["mm_token_type_ids"][:, :end]
+    return BatchEncoding(out)
+
+
+@torch.no_grad()
+def _eval_generate(
+    model: ModelType,
+    processor: ProcessorType,
+    cache: RetrievalCache,
+    context_len: int,
+    enc_full: BatchEncoding,
+    n: int,
+    max_new_tokens: int,
+) -> GenerationResult:
+    query_ids = enc_full["input_ids"][:, n:].to(model.device)
+    q_len = query_ids.shape[1]
+    gen_kwargs: dict[str, Any] = {
+        "input_ids": query_ids,
+        "attention_mask": torch.ones((1, q_len), device=model.device),
+        "position_ids": torch.arange(
+            context_len, context_len + q_len, device=model.device
+        ).unsqueeze(0),
+    }
+    if "mm_token_type_ids" in enc_full:
+        gen_kwargs["mm_token_type_ids"] = enc_full["mm_token_type_ids"][:, n:].to(
+            model.device
+        )
+
+    # qdrant_retrieve is accumulated by the retriever; reset so we read this gen
+    timers.qdrant_retrieve.reset()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    out = model.generate(  # ty:ignore[invalid-argument-type]
+        **gen_kwargs,
+        max_new_tokens=max_new_tokens,
+        past_key_values=cache,
+        use_cache=True,
+        do_sample=False,
+    )
+    torch.cuda.synchronize()
+    seconds = time.perf_counter() - t0
+
+    new = out[0, q_len:]
+    text = processor.tokenizer.decode(new, skip_special_tokens=True)
+    return GenerationResult(
+        text=text,
+        tokens=int(new.shape[0]),
+        seconds=seconds,
+        retrieval_seconds=timers.qdrant_retrieve.total,
+    )
+
+
+class CmdEval(BaseModel):
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    task: Literal["niah", "qa"] = "qa"
+    buckets: str = "71680"
+    n_retrieved: int = 128
+    hnsw_ef: int | None = None
+    max_new_tokens: int = 128
+    # task knobs (n_keys only used by niah)
+    n_keys: int = 1
+    depth: float = 0.5
+    seed: int = 0
+    n_examples: int = 5
+    # which retrievers to score; exact/hnsw run on the same per-example edge shards
+    full: bool = True
+    exact: bool = True
+    hnsw: bool = True
+    topk: bool = False
+    url: str = "localhost"
+    api_key: str | None = None
+    upsert_batch_size: int = 1024
+    prefill_batch_size: int = 4096
+    out: str = ""
+
+    def cli_cmd(self) -> None:
+        buckets = sorted({int(b) for b in self.buckets.split(",") if b.strip()})
+        multimodal = self.model_name in IS_MULTIMODAL
+
+        rows: list[EvalRow] = []
+        loaded_factor: int | None = None
+        model: ModelType | None = None
+        processor: ProcessorType | None = None
+
+        for bucket in buckets:
+            factor = _yarn_factor(bucket)
+            if factor != loaded_factor:
+                if model is not None:
+                    del model, processor
+                    torch.cuda.empty_cache()
+                model, processor = _load_model(self.model_name, bucket)
+                loaded_factor = factor
+            assert model is not None and processor is not None
+
+            if self.task == "niah":
+                examples = generate_niah_examples(
+                    processor.tokenizer,
+                    bucket,
+                    self.n_keys,
+                    self.depth,
+                    self.n_examples,
+                    self.seed,
+                    multimodal,
+                )
+            else:
+                examples = generate_qa_examples(
+                    processor.tokenizer,
+                    bucket,
+                    self.depth,
+                    self.n_examples,
+                    self.seed,
+                    multimodal,
+                )
+            for ex in examples:
+                rows.extend(self._eval_example(model, processor, ex))
+
+        self._report(rows)
+
+    def _eval_example(
+        self, model: ModelType, processor: ProcessorType, ex: EvalExample
+    ) -> list[EvalRow]:
+        enc, n = _encode_eval(processor, ex)
+        prefill = DynamicCache(config=model.config)
+        _do_prefill(_slice_inputs(enc, n), model, prefill, self.prefill_batch_size)
+
+        edge_root = (
+            Path(tempfile.mkdtemp(prefix="eval_edge_", dir="cache"))
+            if self.exact or self.hnsw
+            else None
+        )
+        gens: dict[str, GenerationResult] = {}
+        try:
+            if edge_root is not None:
+                _upsert(
+                    prefill,
+                    self.url,
+                    self.upsert_batch_size,
+                    api_key=self.api_key,
+                    edge_root=edge_root,
+                )
+            cache = RetrievalCache(
+                retriever=FullContextRetriever(), prefill=prefill, config=model.config
+            )
+
+            def run(name: str, retriever: Any) -> None:
+                cache.retriever = retriever
+                gens[name] = _eval_generate(
+                    model, processor, cache, n, enc, n, self.max_new_tokens
+                )
+                cache.reset()
+
+            if self.topk:
+                run("topk", TopKRetriever(n_retrieved=self.n_retrieved))
+            if self.full:
+                run("full", FullContextRetriever())
+            if edge_root is not None:
+                # one engine holds an exclusive WAL lock on the shards, so reuse
+                # it for exact and hnsw rather than opening a second
+                native = QdrantEdgeNativeRetriever(
+                    edge_root=str(edge_root), n_retrieved=self.n_retrieved
+                )
+                if self.exact:
+                    native.exact, native.hnsw_ef = True, None
+                    run("exact", native)
+                if self.hnsw:
+                    native.exact, native.hnsw_ef = False, self.hnsw_ef
+                    run("hnsw", native)
+        finally:
+            del prefill
+            torch.cuda.empty_cache()
+            if edge_root is not None:
+                shutil.rmtree(edge_root, ignore_errors=True)
+
+        # exact/topk scored vs full; hnsw vs exact (the graph-quality gap)
+        ref = {"topk": "full", "exact": "full", "hnsw": "exact"}
+        rows = []
+        for name, gen in gens.items():
+            row = score_row(
+                ex.bucket,
+                ex.idx,
+                name,
+                gen,
+                ex.label,
+                reference=gens.get(ref.get(name, "")),
+            )
+            rows.append(row)
+            ms = 1e3 * row.gen_seconds / max(row.gen_tokens, 1)
+            console.print(
+                f"[dim]{ex.bucket} #{ex.idx} {name}:[/] "
+                f"contain={row.containment:.0f} f1={row.token_f1:.2f} "
+                f"{ms:.0f}ms/tok"
+            )
+        return rows
+
+    def _report(self, rows: list[EvalRow]) -> None:
+        out_path = Path(
+            self.out or f"cache/eval/niah_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps([r.model_dump() for r in rows], indent=2, ensure_ascii=False)
+        )
+
+        table = Table(title="NIAH accuracy")
+        cols = (
+            "bucket",
+            "config",
+            "n",
+            "containment",
+            "token_f1",
+            "rouge_l",
+            "ms/tok",
+            "retr ms/tok",
+        )
+        for col in cols:
+            table.add_column(col)
+        seen: dict[tuple[int, str], list[EvalRow]] = {}
+        for r in rows:
+            seen.setdefault((r.bucket, r.config), []).append(r)
+        for (bucket, config), group in sorted(seen.items()):
+            n = len(group)
+
+            def mean(attr: str, group=group, n=n) -> float:
+                return sum(getattr(r, attr) for r in group) / n
+
+            def per_tok(attr: str, group=group) -> float:
+                toks = sum(r.gen_tokens for r in group) or 1
+                return 1e3 * sum(getattr(r, attr) for r in group) / toks
+
+            table.add_row(
+                str(bucket),
+                config,
+                str(n),
+                f"{mean('containment'):.2f}",
+                f"{mean('token_f1'):.2f}",
+                f"{mean('rouge_l'):.2f}",
+                f"{per_tok('gen_seconds'):.0f}",
+                f"{per_tok('retrieval_seconds'):.0f}",
+            )
+        console.print(table)
+        console.print(f"wrote {out_path}")
+
+
 class CmdKvSearch(
     BaseModel,
     cli_shortcuts={
@@ -1145,6 +1430,7 @@ class CmdKvSearch(
     prefill: CliSubCommand[CmdPrefill]
     chat: CliSubCommand[CmdChat]
     analyze: CliSubCommand[CmdAnalyze]
+    eval: CliSubCommand[CmdEval]
 
     def cli_cmd(self) -> None:
         CliApp.run_subcommand(self)
