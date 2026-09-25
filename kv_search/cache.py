@@ -1,6 +1,7 @@
 import compression.zstd
 import json
 import math
+import subprocess
 import types
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -59,6 +60,9 @@ class AttentionPartition:
 
 
 class Retriever(Protocol):
+    @property
+    def type(self) -> str: ...
+
     def retrieve(
         self,
         query_states: torch.Tensor,
@@ -161,6 +165,8 @@ class TopKRetriever(BaseModel):
 
     def reset_indices(self) -> None:
         self._indices.clear()
+        self._scores.clear()
+        self._dynamic_scores.clear()
 
     def record_dynamic_scores(self, layer_idx: int, scores: torch.Tensor) -> None:
         self._dynamic_scores.setdefault(layer_idx, []).append(
@@ -173,10 +179,23 @@ class TopKRetriever(BaseModel):
             scores = torch.cat(self._scores[layer_idx], dim=1)
             max_len = max(x.shape[-1] for x in self._dynamic_scores[layer_idx])
             for i, t in enumerate(self._dynamic_scores[layer_idx]):
-                self._dynamic_scores[layer_idx][i] = torch.cat([t, torch.full((t.shape[0], t.shape[1], max_len - t.shape[2]), torch.nan)], dim=2)
+                self._dynamic_scores[layer_idx][i] = torch.cat(
+                    [
+                        t,
+                        torch.full(
+                            (t.shape[0], t.shape[1], max_len - t.shape[2]), torch.nan
+                        ),
+                    ],
+                    dim=2,
+                )
             dynamic_scores = torch.cat(self._dynamic_scores[layer_idx], dim=1)
             save_file(
-                    {"indices": indices, "scores": scores, "dynamic_scores": dynamic_scores}, str(path / f"indices_{layer_idx:02d}.safetensors")
+                {
+                    "indices": indices,
+                    "scores": scores,
+                    "dynamic_scores": dynamic_scores,
+                },
+                str(path / f"indices_{layer_idx:02d}.safetensors"),
             )
 
 
@@ -272,8 +291,9 @@ class QdrantEdgeNativeRetriever(BaseModel):
     edge_root: str = "cache/edge"
     # exact top-n (tailM's gate was measured on it); false: HNSW search of the key graph
     exact: bool = True
-    # HNSW beam width when not exact (qdrant-edge raises it to n_retrieved)
-    hnsw_ef: int = 128
+    # HNSW beam width when not exact; None lets qdrant-edge use its own default
+    # (ef_construct, raised to n_retrieved when smaller)
+    hnsw_ef: int | None = None
 
     # the TailmRuntime whose layers are registered with the engine (attach_tailm)
     _tailm: "TailmRuntime | None" = PrivateAttr(default=None)
@@ -376,7 +396,7 @@ class QdrantEdgeRetriever(BaseModel):
     edge_root: str = "cache/edge"
     # as QdrantEdgeNativeRetriever
     exact: bool = True
-    hnsw_ef: int = 128
+    hnsw_ef: int | None = None
 
     _shards: dict[tuple[int, int], edge.EdgeShard] = PrivateAttr(default_factory=dict)
 
@@ -384,7 +404,9 @@ class QdrantEdgeRetriever(BaseModel):
         key = (layer_idx, head_idx)
         if key in self._shards:
             return self._shards[key]
-        shard = edge.EdgeShard.load(f"{self.edge_root}/layer{layer_idx:02d}_head{head_idx}")
+        shard = edge.EdgeShard.load(
+            f"{self.edge_root}/layer{layer_idx:02d}_head{head_idx}"
+        )
         self._shards[key] = shard
         return shard
 
@@ -478,6 +500,7 @@ class RetrievalCache(DynamicCache):
         config: PreTrainedConfig | None = None,
         tailm: "TailmRuntime | None" = None,
         check: "TailmCheck | None" = None,
+        recorder: SessionRecorder | None = None,
     ):
         super().__init__(config=config)
         self.retriever = retriever
@@ -486,6 +509,7 @@ class RetrievalCache(DynamicCache):
         self.tailm = tailm
         # --tailm-check readout; observes only forwards where the tail step ran
         self.check = check
+        self.recorder = recorder
         self._restore_state()
 
     def _restore_state(self):
@@ -609,6 +633,15 @@ class RetrievalCache(DynamicCache):
         query_states: torch.Tensor | None = None,
         **kwargs,
     ):
+        if (
+            self.recorder is not None
+            and query_states is not None
+            and isinstance(
+                self.retriever, (FullContextRetriever, QdrantEdgeNativeRetriever)
+            )
+        ):
+            self.recorder.record_query(layer_idx, query_states)
+
         keys, values = super().update(
             key_states, value_states, layer_idx, *args, **kwargs
         )
@@ -682,15 +715,10 @@ class RecordingCache(DynamicCache):
                 }
             ).encode()
 
-            # make sure the header fits in its slot
             assert len(header) <= 256 - 8
-
-            # pad header with space, which is valid json
-            header += b" " * (256 - 8 - len(header))
+            header += b" " * (256 - 8 - len(header))  # pad with spaces (valid json)
 
             f.seek(0)
-
-            # write header size
             f.write((256 - 8).to_bytes(8, "little"))
 
             f.write(header)
@@ -698,6 +726,87 @@ class RecordingCache(DynamicCache):
 
         self._files.clear()
         self._shapes.clear()
+
+
+class SessionRecorder:
+    def __init__(self, out_dir: Path, meta: dict[str, str]):
+        self.out_dir = out_dir
+        self.meta = meta
+        self._chunks: dict[str, list[torch.Tensor]] = {}
+        self._layers: set[int] = set()
+        self._scaling: float | None = None
+
+    def _append(self, name: str, t: torch.Tensor) -> None:
+        self._chunks.setdefault(name, []).append(
+            t.to("cpu", torch.float32).contiguous()
+        )
+
+    def record_query(self, layer_idx: int, query_states: torch.Tensor) -> None:
+        self._layers.add(layer_idx)
+        # [1, heads, q, d] -> [q, heads, d], so rows are token positions
+        self._append(f"layer{layer_idx:02d}/queries", query_states[0].transpose(0, 1))
+
+    def record_attn_out(
+        self, layer_idx: int, attn_output: torch.Tensor, scaling: float
+    ) -> None:
+        # attn_output is pre-reshape [1, q, heads, d], already token-major
+        self._append(f"layer{layer_idx:02d}/attn_out", attn_output[0])
+        self._scaling = scaling
+
+    def reset(self) -> None:
+        self._chunks.clear()
+        self._layers.clear()
+
+    @property
+    def n_rows(self) -> int:
+        chunks = next(iter(self._chunks.values()), [])
+        return sum(t.shape[0] for t in chunks)
+
+    def save(
+        self,
+        cache: RetrievalCache,
+        prompt_idx: int,
+        token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        prompt_len: int,
+        prompt: str,
+        answer: str,
+        logits: torch.Tensor | None = None,
+    ) -> Path:
+        tensors = {name: torch.cat(cs, dim=0) for name, cs in self._chunks.items()}
+
+        if logits is not None:
+            tensors["logits"] = logits.to("cpu", torch.float32).contiguous()
+
+        for layer_idx in sorted(self._layers):
+            layer = cache.layers[layer_idx]
+            assert isinstance(layer, CacheLayerMixin)
+            assert layer.keys is not None and layer.values is not None
+            p = f"layer{layer_idx:02d}"
+            tensors[f"{p}/keys"] = (
+                layer.keys[0].transpose(0, 1).to("cpu", torch.float32).contiguous()
+            )
+            tensors[f"{p}/values"] = (
+                layer.values[0].transpose(0, 1).to("cpu", torch.float32).contiguous()
+            )
+
+        tensors["positions"] = positions.to("cpu", torch.int64).contiguous()
+        tensors["token_ids"] = token_ids.to("cpu", torch.int64).contiguous()
+        tensors["prompt_len"] = torch.tensor([prompt_len], dtype=torch.int64)
+
+        meta = {
+            **self.meta,
+            "scaling": str(self._scaling),
+            "layers": ",".join(str(i) for i in sorted(self._layers)),
+            "prompt": prompt,
+            "answer": answer,
+        }
+
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        path = self.out_dir / f"replay_{prompt_idx:02d}.safetensors"
+        save_file(tensors, str(path), metadata=meta)
+        self.reset()
+        return path
 
 
 def _layer_to_dict(
@@ -759,13 +868,24 @@ def _read_layer(file: Path) -> dict:
     return load(blob)
 
 
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except subprocess.SubprocessError, OSError:
+        return "unknown"
+
+
 @timers.prefill_save
 def save_cache(
     cache: Cache,
     path: Path,
     context_len: int,
 ) -> None:
-    (path / "meta.json").write_text(json.dumps({"context_len": context_len}))
+    (path / "meta.json").write_text(
+        json.dumps({"context_len": context_len, "kv_search_commit": _git_commit()})
+    )
     for i, layer in track(
         enumerate(cache.layers), description="Writing to disk", total=len(cache.layers)
     ):
@@ -817,21 +937,15 @@ def _causal_mask(q_len: int, k_len: int, dtype, device) -> torch.Tensor | None:
 def _make_attention_mask(
     attn_impl: str, q_len: int, k_len: int, dtype, device
 ) -> torch.Tensor | None:
-    # Need to dynamically create our attention mask because transformers does not have sane defaults for causal/attention masks during inference
-    # usually this is created beforehand, when the prompt is tokenized, but we don't know the context length then
+    # built here, not at tokenization time: the context length isn't known then
     if attn_impl not in ("sdpa", "eager"):
         return None
 
     return _causal_mask(q_len, k_len, dtype, device)
 
 
-# HACK: Most of this is somewhat specific to qwen3.5 and also implemented in the slowest possible way
-# generalizing and improving is tbd
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
+    """torch.repeat_interleave(x, dim=1, repeats=n_rep): [b, kv_heads, s, d] -> [b, kv_heads*n_rep, s, d]."""
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states
@@ -862,7 +976,9 @@ def _partition_attend(
     lse = torch.logsumexp(attn_weights, dim=-1)
     out = torch.matmul(torch.softmax(attn_weights, dim=-1), value_states)
 
-    return AttentionPartition(out=out, lse=lse, weights=attn_weights if return_weights else None)
+    return AttentionPartition(
+        out=out, lse=lse, weights=attn_weights if return_weights else None
+    )
 
 
 def _merge_partitions(
@@ -950,6 +1066,11 @@ def _qwen_3_5_forward(
             scaling=self.scaling,
             **kwargs,
         )
+
+        if is_full_context and past_key_values.recorder is not None:
+            past_key_values.recorder.record_attn_out(
+                self.layer_idx, attn_output, self.scaling
+            )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = attn_output * torch.sigmoid(gate)

@@ -90,3 +90,15 @@ docs/_build/
 
 # niah -r native HNSW reference results (local, 2026-09-24)
 /niah-native-hnsw/
+
+RUNBOOK.md
+
+/*.png
+notebooks/*.png
+notebooks/*_files/
+notebooks/fig_edge/
+notebooks/edge_download.html
+notebooks/edge_download_report.md
+
+scratch/
+shell.nix

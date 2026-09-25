@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import io
 import json
 import math
@@ -29,6 +30,7 @@ os.environ.setdefault("HF_HUB_VERBOSITY", "error")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import importlib.util
+from collections.abc import Callable
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Literal
@@ -37,9 +39,10 @@ import rich
 import torch
 import transformers.utils.logging
 from pydantic import BaseModel, Field
-from pydantic_settings import CliApp, CliSubCommand
+from pydantic_settings import CliApp, CliPositionalArg, CliSubCommand
 from rich.console import Console
 from rich.progress import track
+from rich.table import Table
 from safetensors import SafetensorError
 
 # auto_docstring emits [ERROR] lines via print() at class-definition time
@@ -68,7 +71,7 @@ with contextlib.redirect_stdout(io.StringIO()):
 
 from kv_search import proj as projmod
 from kv_search._native import tailm_kernel
-from kv_search.analysis import CachedData
+from kv_search.analysis import CachedData, plots
 from kv_search.cache import (
     FullContextRetriever,
     QdrantEdgeNativeRetriever,
@@ -77,12 +80,21 @@ from kv_search.cache import (
     RecordingCache,
     RetrievalCache,
     RetrieverConfig,
+    SessionRecorder,
     TopKRetriever,
+    _git_commit,
     bind_query_aware_cache,
     load_cache,
     save_cache,
 )
-from kv_search.data import Datasets, Message, load_dataset
+from kv_search.data import (
+    Datasets,
+    EvalExample,
+    generate_niah_examples,
+    generate_qa_examples,
+    load_dataset,
+)
+from kv_search.eval import EvalRow, GenerationResult, score_row
 from kv_search.tailm import VERSION as TAILM_VERSION
 from kv_search.tailm_runtime import TailmCheck, TailmRuntime
 from kv_search.timer import timers
@@ -145,18 +157,15 @@ def _size_to_tokens(label: str) -> int:
 
 
 def _yarn_factor(context_tokens: int) -> int:
-    """Smallest integer YaRN factor covering the context; 1 (=> no YaRN) at or
-    below the native window. Applied only per-tier so sub-native runs stay
-    undistorted (static YaRN degrades short contexts)."""
+    """Smallest integer YaRN factor covering the context; 1 (no YaRN) at or below the native
+    window. Per-tier so sub-native runs stay undistorted (static YaRN degrades short contexts)."""
     return max(1, math.ceil(context_tokens / NATIVE_MAX_POSITIONS))
 
 
 def _apply_yarn(config: Any, context_tokens: int) -> int:
-    """Flip `config` to YaRN when the tier exceeds the native window; returns the
-    factor (1 = untouched). Every path that hands a config to something
-    RoPE-aware (`_load_model`, the tailM build's `tailm.rope_inv_freq`) must go
-    through here so prefill keys, decode queries and shifted prefill queries
-    all agree on the frequencies."""
+    """Flip `config` to YaRN above the native window (returns the factor, 1 = untouched). Every
+    RoPE-aware path must go through here so prefill keys, decode queries and shifted prefill
+    queries share frequencies."""
     factor = _yarn_factor(context_tokens)
     if factor > 1:
         # nested text_config for multimodal Qwen3.5; fall back to top-level
@@ -176,11 +185,9 @@ def _apply_yarn(config: Any, context_tokens: int) -> int:
 
 
 def load_model_config(model_name: str, context_tokens: int = 0) -> Any:
-    """The HF config for `model_name` as the tier of `context_tokens` runs it:
-    YaRN-patched above the native window, untouched below. Use this -- not a bare
-    `AutoConfig.from_pretrained` -- wherever the config feeds anything RoPE-aware,
-    so scripts and commands can never shift queries with frequencies the prefill
-    did not use."""
+    """The HF config for `model_name` at this tier: YaRN-patched above the native window, untouched
+    below. Use this (not a bare `AutoConfig.from_pretrained`) wherever the config feeds anything
+    RoPE-aware, so queries can't be shifted with frequencies the prefill didn't use."""
     config = AutoConfig.from_pretrained(model_name)
     _apply_yarn(config, context_tokens)
     return config
@@ -193,12 +200,12 @@ def _load_model(
     config = load_model_config(model_name, context_tokens)
 
     processor: ProcessorType = AutoProcessor.from_pretrained(model_name)
-    load_kwargs = dict(
-        config=config,
-        attn_implementation=_ATTN_IMPL,
-        dtype=torch.bfloat16,
-        device_map="cuda",
-    )
+    load_kwargs = {
+        "config": config,
+        "attn_implementation": _ATTN_IMPL,
+        "dtype": torch.bfloat16,
+        "device_map": "cuda",
+    }
     if model_name in IS_MULTIMODAL:
         model: ModelType = AutoModelForMultimodalLM.from_pretrained(
             model_name, **load_kwargs
@@ -221,19 +228,11 @@ def _cache_dir(dataset_name: Datasets, qdrant_size: str, model_type: str) -> Pat
 
 @timers.prefill_gen
 def _do_prefill(
-    messages: Message,
+    inputs: BatchEncoding,
     model: ModelType,
-    processor: ProcessorType,
-    past_key_values: RecordingCache,
+    past_key_values: DynamicCache,
     batch_size: int = 4096,
 ):
-    inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
-        messages.prefill,
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-    )  # ty:ignore[invalid-assignment]
     input_chunks = torch.split(inputs["input_ids"], batch_size, -1)
     attention_masks = torch.split(inputs["attention_mask"], batch_size, -1)
     if "mm_token_type_ids" in inputs:
@@ -291,6 +290,8 @@ def _upsert(
     model_config: Any = None,
     queries_dir: Path | None = None,
     only: set[str] | None = None,
+    segments: int = 1,
+    vectors_on_disk: bool = True,
 ):
     """Upload every (full-attention layer, KV head) into its own collection, let the server
     build the key HNSW graph, and unpack its snapshot into `edge_root/layerLL_headH`.
@@ -371,17 +372,19 @@ def _upsert(
                 "key": VectorParams(
                     size=d,
                     distance=Distance.DOT,
-                    on_disk=True,
-                    hnsw_config=HnswConfigDiff(m=0, on_disk=True),
+                    on_disk=vectors_on_disk,
+                    hnsw_config=HnswConfigDiff(m=0, on_disk=vectors_on_disk),
                 ),
                 "value": VectorParams(
                     size=d,
                     distance=Distance.DOT,
-                    on_disk=True,
+                    on_disk=vectors_on_disk,
                     hnsw_config=HnswConfigDiff(m=0),
                 ),
             },
-            optimizers_config=OptimizersConfigDiff(indexing_threshold=0),
+            optimizers_config=OptimizersConfigDiff(
+                indexing_threshold=0, default_segment_number=segments
+            ),
         )
 
         # convert on CPU so no f32 temp lands in GPU/unified memory
@@ -401,9 +404,14 @@ def _upsert(
             client.update_collection(
                 collection_name=name,
                 vectors_config={
-                    "key": VectorParamsDiff(hnsw_config=HnswConfigDiff(m=16))
+                    "key": VectorParamsDiff(
+                        hnsw_config=HnswConfigDiff(m=16, on_disk=vectors_on_disk)
+                    )
                 },
-                optimizers_config=OptimizersConfigDiff(indexing_threshold=20000),
+                # threshold below the single segment's size so the graph builds
+                optimizers_config=OptimizersConfigDiff(
+                    indexing_threshold=1000, default_segment_number=segments
+                ),
             )
         else:
             assert queries_dir is not None
@@ -751,7 +759,14 @@ class CmdPrefill(ProjFlags):
                 qdrant_size=self.qdrant_size,
             )
 
-            _do_prefill(messages, model, processor, cache, self.prefill_batch_size)
+            inputs: BatchEncoding = processor.apply_chat_template(
+                messages.prefill,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )  # ty:ignore[invalid-assignment]
+            _do_prefill(inputs, model, cache, self.prefill_batch_size)
 
             save_cache(
                 cache,
@@ -910,6 +925,7 @@ class CmdChat(TailmFlags, ProjDir):
     max_new_tokens: int = 256
     render_live: bool = True
     record_indices: bool = False
+    record_prompts: bool = False
 
     def cli_cmd(self) -> None:
         self.tailm_preflight(self.model_name, self.retriever.type)
@@ -962,12 +978,35 @@ class CmdChat(TailmFlags, ProjDir):
                 retriever_type=self.retriever.type,
             )
             self.tailm_attach(self.retriever, tailm)
+
+        recorder: SessionRecorder | None = None
+        if self.record_prompts:
+            recorder = SessionRecorder(
+                cache_dir / "replay",
+                meta={
+                    "model": self.model_name,
+                    "dataset": str(self.dataset_name),
+                    "qdrant_size": self.qdrant_size,
+                    "context_len": str(context_len),
+                    "attn_implementation": model.config._attn_implementation,
+                    "kv_search_commit": _git_commit(),
+                },
+            )
+            if not isinstance(
+                self.retriever, (FullContextRetriever, QdrantEdgeNativeRetriever)
+            ):
+                console.print(
+                    "[yellow]record_prompts only records under `-r full` or `-r native`; "
+                    "switch with /full or /native in the repl[/]"
+                )
+
         cache = RetrievalCache(
             retriever=self.retriever,
             prefill=prefill,
             config=model.config,
             tailm=tailm,
             check=check,
+            recorder=recorder,
         )
 
         streamer = TimedStreamer(processor.tokenizer, skip_prompt=True)
@@ -1032,7 +1071,7 @@ class CmdChat(TailmFlags, ProjDir):
                 elif cmd in _RETRIEVERS:
                     if cmd not in instances:
                         r = _RETRIEVERS[cmd]()
-                        if hasattr(r, "n_retrieved"):
+                        if not isinstance(r, FullContextRetriever):
                             r.n_retrieved = n_retrieved
                         for k, v in search.items():
                             if hasattr(r, k):
@@ -1052,11 +1091,17 @@ class CmdChat(TailmFlags, ProjDir):
             if record:
                 cache.retriever.reset_indices()
 
+            record_prompt = cache.recorder is not None and isinstance(
+                cache.retriever, (FullContextRetriever, QdrantEdgeNativeRetriever)
+            )
+            if record_prompt:
+                cache.recorder.reset()
+
             # isolate this prompt's timings; discard the first (cold) prompt when measuring
             timers.reset_generation()
             torch.cuda.reset_peak_memory_stats()
             try:
-                prompt_len = self._generate(
+                prompt_len, out, logits = self._generate(
                     model, processor, cache, context_len, streamer, user
                 )
                 if record:
@@ -1067,6 +1112,28 @@ class CmdChat(TailmFlags, ProjDir):
                         json.dumps({"prompt_len": prompt_len})
                     )
                     cache.retriever.save_indices(tmp)
+                if record_prompt:
+                    n_rows = cache.recorder.n_rows
+                    token_ids = out[0, :n_rows]
+                    positions = context_len + torch.arange(n_rows)
+                    answer = processor.tokenizer.decode(
+                        out[0, prompt_len:], skip_special_tokens=True
+                    )
+                    path = cache.recorder.save(
+                        cache,
+                        prompt_idx,
+                        token_ids,
+                        positions,
+                        prompt_len,
+                        user,
+                        answer,
+                        logits=logits,
+                    )
+                    console.print(
+                        f"[green]recorded {n_rows} positions"
+                        f"{f', logits {tuple(logits.shape)}' if logits is not None else ''}"
+                        f" -> {path}[/]"
+                    )
                 prompt_idx += 1
             except KeyboardInterrupt:
                 streamer.end()
@@ -1086,7 +1153,7 @@ class CmdChat(TailmFlags, ProjDir):
         context_len: int,
         streamer: TimedStreamer,
         user: str,
-    ) -> int:
+    ) -> tuple[int, torch.Tensor, torch.Tensor | None]:
         inputs: BatchEncoding[torch.Tensor] = processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "text", "text": user}]}],  # ty:ignore[invalid-argument-type]
             add_generation_prompt=True,
@@ -1103,30 +1170,531 @@ class CmdChat(TailmFlags, ProjDir):
             context_len, context_len + prompt_len, device=model.device
         ).unsqueeze(0)
 
-        model.generate(
+        gen_kwargs: dict[str, Any] = {}
+        if self.record_prompts:
+            # collect per-step next-token logits for the recording
+            gen_kwargs["output_logits"] = True
+            gen_kwargs["return_dict_in_generate"] = True
+
+        out = model.generate(  # ty:ignore[invalid-argument-type]
             **inputs,  # ty:ignore[invalid-argument-type]
             max_new_tokens=self.max_new_tokens,
             past_key_values=cache,
             use_cache=True,
             streamer=streamer,
-        )  # ty:ignore[invalid-argument-type]
+            do_sample=False,
+            **gen_kwargs,
+        )
 
-        return prompt_len
+        if self.record_prompts:
+            # out.logits: tuple (len = num_generated) of [1, vocab] -> [num_generated, vocab]
+            logits = torch.stack(out.logits, dim=0)[:, 0, :]  # ty:ignore[unresolved-attribute, invalid-argument-type]
+            return prompt_len, out.sequences, logits  # ty:ignore[unresolved-attribute]
+        return prompt_len, out, None  # ty:ignore[invalid-return-type]
 
 
-class CmdAnalyze(BaseModel):
+class CmdFigures(BaseModel):
+    """Exploratory figures/tables (index heatmap, scores, cross-layer, mse) into the cache dir."""
+
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
     qdrant_size: str = "100k"
 
     def cli_cmd(self) -> None:
         config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
-
         cache_dir = _cache_dir(self.dataset_name, self.qdrant_size, config.model_type)
         cache_dir.mkdir(exist_ok=True, parents=True)
-
         data = CachedData(cache_dir, model_name=self.model_name)
-        data.analyze()
+        plots.analyze(data)
+
+
+class CmdAnalyze(BaseModel):
+    """Run registered analyses over sizes and write envelopes to cache/analysis/.
+    names and sizes are comma-separated (e.g. `analyze sweep,reuse -s 100k,1M`)."""
+
+    names: CliPositionalArg[str]
+    sizes: str = "100k,200k,1M"
+    n_prompts: int = 5
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+
+    def cli_cmd(self) -> None:
+        from kv_search.analysis import io, registry
+
+        config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
+        for name in self.names.split(","):
+            a = registry.ANALYSES[name]
+            sizes_out: dict = {}
+            for size in self.sizes.split(","):
+                cache_dir = _cache_dir(self.dataset_name, size, config.model_type)
+                if a.per_prompt and len(sorted(cache_dir.glob("indices0*/"))) < self.n_prompts:
+                    console.print(f"[yellow]skip {name}/{size}: <{self.n_prompts} prompts[/]")
+                    continue
+                data = CachedData(
+                    cache_dir, model_name=self.model_name, load_prefill=a.needs_prefill
+                )
+                sizes_out[size] = a.run(data, self.n_prompts)
+                console.print(f"[green]{name}/{size} done[/]")
+                del data
+                torch.cuda.empty_cache()
+            path = io.write_envelope(
+                name, self.model_name, {"n_prompts": self.n_prompts}, sizes_out
+            )
+            console.print(f"[green]wrote {path}[/]")
+
+
+def _encode_eval(
+    processor: ProcessorType, ex: EvalExample
+) -> tuple[BatchEncoding, int]:
+    # render once and split at the final user turn, so prefill is a true prefix
+    # of the decode input (rendering prefill separately drifts on Qwen's per-turn
+    # think handling)
+    enc: BatchEncoding = processor.apply_chat_template(
+        ex.prefill + ex.query,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        enable_thinking=False,
+    )  # ty:ignore[invalid-assignment]
+    ids = enc["input_ids"][0].tolist()
+    im_start = processor.tokenizer.convert_tokens_to_ids("<|im_start|>")
+    user_tok = processor.tokenizer.encode("user", add_special_tokens=False)[0]
+    starts = [
+        i for i in range(len(ids) - 1) if ids[i] == im_start and ids[i + 1] == user_tok
+    ]
+    if not starts:
+        raise RuntimeError("could not locate final user turn in render")
+    return enc, starts[-1]
+
+
+def _slice_inputs(enc: BatchEncoding, end: int) -> BatchEncoding:
+    out = {
+        "input_ids": enc["input_ids"][:, :end],
+        "attention_mask": enc["attention_mask"][:, :end],
+    }
+    if "mm_token_type_ids" in enc:
+        out["mm_token_type_ids"] = enc["mm_token_type_ids"][:, :end]
+    return BatchEncoding(out)
+
+
+@torch.no_grad()
+def _eval_generate(
+    model: ModelType,
+    processor: ProcessorType,
+    cache: RetrievalCache,
+    context_len: int,
+    enc_full: BatchEncoding,
+    n: int,
+    max_new_tokens: int,
+) -> GenerationResult:
+    query_ids = enc_full["input_ids"][:, n:].to(model.device)
+    q_len = query_ids.shape[1]
+    gen_kwargs: dict[str, Any] = {
+        "input_ids": query_ids,
+        "attention_mask": torch.ones((1, q_len), device=model.device),
+        "position_ids": torch.arange(
+            context_len, context_len + q_len, device=model.device
+        ).unsqueeze(0),
+    }
+    if "mm_token_type_ids" in enc_full:
+        gen_kwargs["mm_token_type_ids"] = enc_full["mm_token_type_ids"][:, n:].to(
+            model.device
+        )
+
+    # warm-up (untimed): absorbs one-time costs - edge shard load/populate, cuda
+    # kernel init, page cache - so the timed run is steady-state and full vs hnsw
+    # compare fairly (full's KV is already resident from prefill).
+    model.generate(  # ty:ignore[invalid-argument-type]
+        **gen_kwargs,
+        max_new_tokens=min(max_new_tokens, 2),
+        past_key_values=cache,
+        use_cache=True,
+        do_sample=False,
+    )
+    cache.reset()
+
+    # qdrant_retrieve is accumulated by the retriever; reset so we read this gen
+    timers.qdrant_retrieve.reset()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    out = model.generate(  # ty:ignore[invalid-argument-type]
+        **gen_kwargs,
+        max_new_tokens=max_new_tokens,
+        past_key_values=cache,
+        use_cache=True,
+        do_sample=False,
+    )
+    torch.cuda.synchronize()
+    seconds = time.perf_counter() - t0
+
+    new = out[0, q_len:]
+    text = processor.tokenizer.decode(new, skip_special_tokens=True)
+    return GenerationResult(
+        text=text,
+        tokens=int(new.shape[0]),
+        seconds=seconds,
+        retrieval_seconds=timers.qdrant_retrieve.total,
+    )
+
+
+# prefill KV is keyed by context only (no segments), so it survives a segment
+# sweep; edge shards depend on segments and get their own cache
+_PREFILL_CACHE = Path("cache/eval_prefill")
+_SHARD_CACHE = Path("cache/eval_shards")
+
+
+def _cache_key(*parts: object) -> str:
+    return hashlib.sha1("|".join(map(str, parts)).encode()).hexdigest()[:16]
+
+
+def _evict(root: Path, keep: int) -> None:
+    """Drop all but the `keep` most-recently-used entries under root."""
+    dirs = sorted(
+        (p for p in root.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+    )
+    for d in dirs[: max(0, len(dirs) - keep)]:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _cached_dir(
+    root: Path,
+    key: str,
+    keep: int,
+    build: Callable[[Path], None],
+    rebuild: bool = False,
+) -> Path:
+    """Return root/key, running build(tmp) into a temp dir on a miss and
+    publishing it atomically. Keeps the `keep` most-recent entries."""
+    d = root / key
+    if rebuild:
+        shutil.rmtree(d, ignore_errors=True)
+    if d.exists():
+        os.utime(d, None)  # mark recently used
+        return d
+    root.mkdir(parents=True, exist_ok=True)
+    _evict(root, keep - 1)
+    tmp = Path(tempfile.mkdtemp(dir=root))
+    build(tmp)
+    os.replace(tmp, d)
+    return d
+
+
+class CmdEval(BaseModel):
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    task: Literal["niah", "qa"] = "qa"
+    buckets: str = "71680"
+    n_retrieved: int = 128
+    hnsw_ef: int | None = None
+    hnsw_segments: int = 1
+    max_new_tokens: int = 128
+    # task knobs (n_keys only used by niah)
+    n_keys: int = 1
+    depth: float = 0.5
+    seed: int = 0
+    n_examples: int = 5
+    # which retrievers to score; exact/hnsw run on the same per-example edge shards
+    full: bool = True
+    exact: bool = True
+    hnsw: bool = True
+    topk: bool = False
+    url: str = "localhost"
+    api_key: str | None = None
+    upsert_batch_size: int = 1024
+    # build-time memory tier: True = on disk (Cold, paged on demand), False = in
+    # RAM / Cached (edge pre-loads into page cache on open). Persisted in the shard.
+    vectors_on_disk: bool = True
+    # cache prefills + shards across runs; keep the N most-recent per cache.
+    # rebuild_shards forces re-upsert (edge build constants aren't in the key);
+    # prefill is fully keyed, so clear cache/eval_prefill by hand if code changes
+    cache_max: int = 6
+    rebuild_shards: bool = False
+    prefill_batch_size: int = 4096
+    out: str = ""
+
+    def cli_cmd(self) -> None:
+        buckets = sorted({int(b) for b in self.buckets.split(",") if b.strip()})
+        multimodal = self.model_name in IS_MULTIMODAL
+
+        rows: list[EvalRow] = []
+        loaded_factor: int | None = None
+        model: ModelType | None = None
+        processor: ProcessorType | None = None
+
+        for bucket in buckets:
+            factor = _yarn_factor(bucket)
+            if factor != loaded_factor:
+                if model is not None:
+                    del model, processor
+                    torch.cuda.empty_cache()
+                model, processor = _load_model(self.model_name, bucket)
+                loaded_factor = factor
+            assert model is not None and processor is not None
+
+            if self.task == "niah":
+                examples = generate_niah_examples(
+                    processor.tokenizer,
+                    bucket,
+                    self.n_keys,
+                    self.depth,
+                    self.n_examples,
+                    self.seed,
+                    multimodal,
+                )
+            else:
+                examples = generate_qa_examples(
+                    processor.tokenizer,
+                    bucket,
+                    self.depth,
+                    self.n_examples,
+                    self.seed,
+                    multimodal,
+                )
+            for ex in examples:
+                rows.extend(self._eval_example(model, processor, ex))
+
+        self._report(rows)
+
+    def _cached_prefill(
+        self, model: ModelType, enc: Any, n: int, ex: EvalExample
+    ) -> DynamicCache:
+        """Prefill the context KV, cached to disk and reused across runs."""
+        key = _cache_key(
+            self.model_name,
+            self.task,
+            ex.bucket,
+            self.seed,
+            ex.idx,
+            self.n_keys,
+            self.depth,
+        )
+
+        def build(tmp: Path) -> None:
+            prefill = DynamicCache(config=model.config)
+            _do_prefill(_slice_inputs(enc, n), model, prefill, self.prefill_batch_size)
+            save_cache(prefill, tmp, n)
+
+        pdir = _cached_dir(_PREFILL_CACHE, key, self.cache_max, build)
+        return load_cache(pdir, model.config)[0]
+
+    def _eval_example(
+        self, model: ModelType, processor: ProcessorType, ex: EvalExample
+    ) -> list[EvalRow]:
+        enc, n = _encode_eval(processor, ex)
+        prefill = self._cached_prefill(model, enc, n, ex)
+
+        edge_root: Path | None = None
+        if self.exact or self.hnsw:
+            key = _cache_key(
+                self.model_name,
+                self.task,
+                ex.bucket,
+                self.seed,
+                ex.idx,
+                self.n_keys,
+                self.depth,
+                self.hnsw_segments,
+                self.vectors_on_disk,
+            )
+
+            def build(tmp: Path, prefill: DynamicCache = prefill) -> None:
+                _upsert(
+                    prefill,
+                    self.url,
+                    self.upsert_batch_size,
+                    api_key=self.api_key,
+                    edge_root=tmp,
+                    segments=self.hnsw_segments,
+                    vectors_on_disk=self.vectors_on_disk,
+                )
+
+            edge_root = _cached_dir(
+                _SHARD_CACHE, key, self.cache_max, build, self.rebuild_shards
+            )
+
+        gens: dict[str, GenerationResult] = {}
+        try:
+            cache = RetrievalCache(
+                retriever=FullContextRetriever(), prefill=prefill, config=model.config
+            )
+
+            def run(name: str, retriever: Any) -> None:
+                cache.retriever = retriever
+                gens[name] = _eval_generate(
+                    model, processor, cache, n, enc, n, self.max_new_tokens
+                )
+                cache.reset()
+
+            if self.topk:
+                run("topk", TopKRetriever(n_retrieved=self.n_retrieved))
+            if self.full:
+                run("full", FullContextRetriever())
+            if edge_root is not None:
+                # full/topk are done; exact/hnsw read the shards, not the prefill
+                # KV, so free it here — lets the mmap'd shards fit in page cache
+                # and avoids disk thrash at long context
+                for layer in prefill.layers:
+                    if isinstance(layer, CacheLayerMixin):
+                        layer.keys = None
+                        layer.values = None
+                torch.cuda.empty_cache()
+                # one engine holds an exclusive WAL lock on the shards, so reuse
+                # it for exact and hnsw rather than opening a second
+                native = QdrantEdgeNativeRetriever(
+                    edge_root=str(edge_root), n_retrieved=self.n_retrieved
+                )
+                if self.exact:
+                    native.exact, native.hnsw_ef = True, None
+                    run("exact", native)
+                if self.hnsw:
+                    native.exact, native.hnsw_ef = False, self.hnsw_ef
+                    run("hnsw", native)
+        finally:
+            del prefill
+            torch.cuda.empty_cache()
+
+        # exact/topk scored vs full; hnsw vs exact (the graph-quality gap)
+        ref = {"topk": "full", "exact": "full", "hnsw": "exact"}
+        rows = []
+        for name, gen in gens.items():
+            row = score_row(
+                ex.bucket,
+                ex.idx,
+                name,
+                gen,
+                ex.label,
+                reference=gens.get(ref.get(name, "")),
+            )
+            rows.append(row)
+            ms = 1e3 * row.gen_seconds / max(row.gen_tokens, 1)
+            console.print(
+                f"[dim]{ex.bucket} #{ex.idx} {name}:[/] "
+                f"contain={row.containment:.0f} f1={row.token_f1:.2f} "
+                f"{ms:.0f}ms/tok"
+            )
+        return rows
+
+    def _report(self, rows: list[EvalRow]) -> None:
+        out_path = Path(
+            self.out or f"cache/eval/niah_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps([r.model_dump() for r in rows], indent=2, ensure_ascii=False)
+        )
+
+        table = Table(title="NIAH accuracy")
+        cols = (
+            "bucket",
+            "config",
+            "n",
+            "containment",
+            "token_f1",
+            "rouge_l",
+            "ms/tok",
+            "retr ms/tok",
+        )
+        for col in cols:
+            table.add_column(col)
+        seen: dict[tuple[int, str], list[EvalRow]] = {}
+        for r in rows:
+            seen.setdefault((r.bucket, r.config), []).append(r)
+        for (bucket, config), group in sorted(seen.items()):
+            n = len(group)
+
+            def mean(attr: str, group=group, n=n) -> float:
+                return sum(getattr(r, attr) for r in group) / n
+
+            def per_tok(attr: str, group=group) -> float:
+                toks = sum(r.gen_tokens for r in group) or 1
+                return 1e3 * sum(getattr(r, attr) for r in group) / toks
+
+            table.add_row(
+                str(bucket),
+                config,
+                str(n),
+                f"{mean('containment'):.2f}",
+                f"{mean('token_f1'):.2f}",
+                f"{mean('rouge_l'):.2f}",
+                f"{per_tok('gen_seconds'):.0f}",
+                f"{per_tok('retrieval_seconds'):.0f}",
+            )
+        console.print(table)
+        console.print(f"wrote {out_path}")
+
+
+class CmdRecord(BaseModel):
+    """Record retrieval data across sizes by driving `chat` over a prompts file.
+    kind=indices -> topk oracle (--record-indices); kind=queries -> native decode
+    queries (--record-prompts)."""
+
+    kind: Literal["indices", "queries"] = "indices"
+    sizes: str = "100k,200k,1M"
+    prompts: str = "prompts_sweep.txt"
+    max_new_tokens: int = 256
+    n_retrieved: int = 128
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+
+    def cli_cmd(self) -> None:
+        for size in self.sizes.split(","):
+            retriever = (
+                TopKRetriever(n_retrieved=self.n_retrieved)
+                if self.kind == "indices"
+                else QdrantEdgeNativeRetriever(n_retrieved=self.n_retrieved)
+            )
+            chat = CmdChat(
+                model_name=self.model_name,
+                dataset_name=self.dataset_name,
+                qdrant_size=size,
+                retriever=retriever,
+                max_new_tokens=self.max_new_tokens,
+                render_live=False,
+                record_indices=(self.kind == "indices"),
+                record_prompts=(self.kind == "queries"),
+            )
+            with open(self.prompts) as f:  # feed prompts to the (stdin-driven) repl
+                orig, sys.stdin = sys.stdin, f
+                try:
+                    chat.cli_cmd()
+                finally:
+                    sys.stdin = orig
+
+
+class CmdRebuildShards(BaseModel):
+    """Rebuild edge shards as HNSW-indexed single-segment shards from the existing
+    prefill (no re-prefill). Needs qdrant running at `url`."""
+
+    sizes: str = "100k,200k,1M"
+    url: str = "localhost"
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+
+    def cli_cmd(self) -> None:
+        config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
+        for size in self.sizes.split(","):
+            cache_dir = _cache_dir(self.dataset_name, size, config.model_type)
+            cache, ctx = load_cache(cache_dir, config, "cpu")
+            console.print(f"[{size}] ctx={ctx}; upserting -> {cache_dir}/edge")
+            _upsert(cache, self.url, edge_root=cache_dir / "edge", parallel=1)
+            del cache
+            console.print(f"[green]{size} done[/]")
+
+
+class CmdReport(BaseModel):
+    """Regenerate report figures from the analysis envelopes and compose report/*.md
+    into one standalone HTML file."""
+
+    report_dir: str = "report"
+    out: str = "cache/report/report.html"
+
+    def cli_cmd(self) -> None:
+        from kv_search import report as rp
+
+        rp.make_figures()
+        path = rp.build_html(report_dir=Path(self.report_dir), out=Path(self.out))
+        console.print(f"[green]wrote {path}[/]")
 
 
 class CmdKvSearch(
@@ -1145,6 +1713,11 @@ class CmdKvSearch(
     prefill: CliSubCommand[CmdPrefill]
     chat: CliSubCommand[CmdChat]
     analyze: CliSubCommand[CmdAnalyze]
+    figures: CliSubCommand[CmdFigures]
+    record: CliSubCommand[CmdRecord]
+    rebuild_shards: CliSubCommand[CmdRebuildShards]
+    report: CliSubCommand[CmdReport]
+    eval: CliSubCommand[CmdEval]
 
     def cli_cmd(self) -> None:
         CliApp.run_subcommand(self)

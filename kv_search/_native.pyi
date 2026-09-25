@@ -9,10 +9,10 @@ class NativeEdgeRetriever:
         self,
         shards: list[tuple[tuple[int, int], str]],
         exact: bool = True,
-        hnsw_ef: int = 128,
+        hnsw_ef: int | None = None,
     ):
         """Load the shards. `exact`: full-scan top-n; otherwise HNSW search with `hnsw_ef`
-        (raised to the limit by qdrant-edge)."""
+        (None -> qdrant-edge's own default, raised to the limit)."""
     @property
     def search_mode(self) -> str:
         """`"exact"` or `"hnsw ef N"`."""
