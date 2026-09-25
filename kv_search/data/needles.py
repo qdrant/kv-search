@@ -1,21 +1,8 @@
 #!/usr/bin/env python3
-"""Offset harness for the qdrant-summary needle set.
-
-For every needle in cache/needles.json, locate its `anchor` in each
-CODEBASE_SUMMARY_<size>.md and record the character offset and the Qwen token
-offset of the fact within that summary. Writes cache/needles_offsets.json.
-
-Because the summaries are exact byte-prefixes of each other, a needle present in
-a small tier keeps the SAME offset in every larger tier -- so you can measure how
-retrieval of a fixed position behaves as the surrounding context grows, and add
-deep needles that only exist in the larger tiers for long-range probing.
-
-NOTE on absolute KV position: these offsets are within the markdown content. The
-model prefills the content wrapped by the chat template, so the absolute position
-in the KV cache is `template_prefix_tokens + token_offset`. Pass the measured
-prefix length via --template-prefix N (default 0) or add it at analysis time; the
-value is constant for a given dataset/model and only shifts every needle equally.
-"""
+"""Locate each needle (cache/needles.json) in every CODEBASE_SUMMARY_<size>.md and record its char
+and Qwen-token offset; writes cache/needles_offsets.json. The summaries are exact byte-prefixes of
+each other, so a needle keeps the SAME offset across all larger tiers. Offsets are within the
+markdown; absolute KV position = template_prefix_tokens + token_offset (pass --template-prefix)."""
 
 from __future__ import annotations
 

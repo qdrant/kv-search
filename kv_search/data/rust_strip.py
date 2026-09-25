@@ -1,12 +1,7 @@
-"""Deterministic Rust signature extractor.
-
-strip_file(src) -> str : returns the source with function/method bodies (and
-const/static initializer blocks and expression bodies) removed, but every item
-signature, type definition, doc comment and attribute kept.
-
-No dependencies, works offline. It is a lexer + recursive brace walker, not a
-full Rust parser, so it favours robustness over perfection: anything it is unsure
-about is kept verbatim rather than dropped.
+"""Deterministic Rust signature extractor: strip_file(src) removes function/method bodies (and
+const/static/expression initializer blocks) but keeps every item signature, type definition, doc
+comment and attribute. A lexer + brace walker, not a full parser -- anything it is unsure about is
+kept verbatim rather than dropped.
 
 Rules:
   fn / async fn / const fn / ... bodies      -> replaced with ` { ... }`

@@ -1,5 +1,3 @@
-"""NIAH scoring."""
-
 import re
 import unicodedata
 

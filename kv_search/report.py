@@ -1,7 +1,5 @@
-"""Report figures + HTML composition. Figures are generated from the analysis envelopes
-(cache/analysis/*.json); prose lives in authored markdown under report/ and is composed
-with the figures into one HTML artifact. Separation is deliberate: code makes figures,
-humans write prose around them."""
+"""Report figures + HTML composition: figures from the analysis envelopes (cache/analysis/*.json),
+prose from authored markdown under report/, composed into one HTML artifact."""
 
 import base64
 import re
@@ -196,12 +194,6 @@ def make_figures(fig_dir: Path = FIG_DIR) -> list[Path]:
         save(fig, "cross_layer_coverage.png")
 
     return written
-
-
-# ---- markdown -> HTML composition -------------------------------------------
-# Minimal renderer for the controlled markdown we author in report/*.md:
-# headings, paragraphs, - lists, > blockquotes, | tables, ![](fig.png) images,
-# **bold**, `code`, [text](url).
 
 
 def _inline(text: str) -> str:

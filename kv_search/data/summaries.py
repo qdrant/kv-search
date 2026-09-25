@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
-"""Build qdrant codebase summaries at increasing Qwen-token sizes.
-
-Recipe (see repo TODO.md / memory `qdrant-summary-dataset`):
-  constant condensed prose preamble (from the existing CODEBASE_SUMMARY.md)
-  + deterministic signature extraction (fn/method bodies stripped, signatures +
-    types + doc comments kept) via rust_strip.strip_file,
-  emitted per-file in a fixed priority order so every size is a superset of the
-  smaller ones (monotonic nesting).
-
-Overshoot every target EXCEPT 1M, which is a hard ceiling (stay under).
-
-  python build_summaries.py --dry-run     # calibration only, writes nothing
-  python build_summaries.py                # generate the files
-"""
+"""Build qdrant codebase summaries at increasing Qwen-token sizes: a constant condensed-prose
+preamble + deterministic signature extraction (bodies stripped, signatures/types/doc-comments
+kept) per file in a fixed priority order, so every size is a superset of the smaller ones.
+Overshoot each target except 1M, a hard ceiling. `--dry-run` calibrates without writing."""
 
 from __future__ import annotations
 
@@ -110,10 +100,8 @@ def list_crate_files(root: str):
 
 
 def ordered_files():
-    """Breadth-balanced round-robin: crate[0][0], crate[1][0], ..., crate[0][1], ...
-    Each crate's entry file (lib.rs/mod.rs) comes first, so even small budgets
-    touch every crate; larger budgets deepen all crates evenly. Fixed order =>
-    every size is a prefix => monotonic nesting."""
+    """Breadth-balanced round-robin over crates (entry file lib.rs/mod.rs first), so even small
+    budgets touch every crate and the fixed order makes every size a prefix (monotonic nesting)."""
     crates = discover_crates()
     crates.sort(key=lambda c: (crate_rank(c[0]), c[0]))
     per_crate = [(label, list_crate_files(root)) for label, root in crates]

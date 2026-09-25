@@ -235,13 +235,10 @@ def centroid_substitution(
     layers: list[int] | None = None,
     seed: int = 0,
 ) -> dict:
-    """Coarse-to-fine centroid sim, keys included. Self-contained on prefill q/k/v (uses
-    the last n_positions prefill queries, not decode queries). Per (layer, kv-head):
-    k-means the keys into C centroids (cluster-mean values). recall_weight[C][nprobe] =
-    top-k attention weight whose cluster ranks in the top nprobe by q.centroid (the
-    scoring/K side). mse_centroid[C][h] keeps the true top-h exact and replaces the tail
-    by centroids (weight from centroid key, value from centroid), vs mse_drop / mse_mean
-    (in-step mean) baselines. Needs prefill."""
+    """Coarse-to-fine centroid sim on prefill q/k/v (last n_positions prefill queries). Per
+    (layer, kv-head): k-means keys into C centroids. recall_weight[C][nprobe] = top-k weight whose
+    cluster ranks top-nprobe by q.centroid; mse_centroid[C][h] keeps the top-h exact and replaces
+    the tail by centroids, vs mse_drop / mse_mean baselines. Needs prefill."""
     assert d.prefill is not None, "needs load_prefill=True"
     if n_centroids is None:
         n_centroids = [256, 1024, 4096]
