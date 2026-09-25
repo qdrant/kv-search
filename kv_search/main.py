@@ -90,7 +90,6 @@ from kv_search.cache import (
 from kv_search.data import (
     Datasets,
     EvalExample,
-    Message,
     generate_niah_examples,
     generate_qa_examples,
     load_dataset,
@@ -158,18 +157,15 @@ def _size_to_tokens(label: str) -> int:
 
 
 def _yarn_factor(context_tokens: int) -> int:
-    """Smallest integer YaRN factor covering the context; 1 (=> no YaRN) at or
-    below the native window. Applied only per-tier so sub-native runs stay
-    undistorted (static YaRN degrades short contexts)."""
+    """Smallest integer YaRN factor covering the context; 1 (no YaRN) at or below the native
+    window. Per-tier so sub-native runs stay undistorted (static YaRN degrades short contexts)."""
     return max(1, math.ceil(context_tokens / NATIVE_MAX_POSITIONS))
 
 
 def _apply_yarn(config: Any, context_tokens: int) -> int:
-    """Flip `config` to YaRN when the tier exceeds the native window; returns the
-    factor (1 = untouched). Every path that hands a config to something
-    RoPE-aware (`_load_model`, the tailM build's `tailm.rope_inv_freq`) must go
-    through here so prefill keys, decode queries and shifted prefill queries
-    all agree on the frequencies."""
+    """Flip `config` to YaRN above the native window (returns the factor, 1 = untouched). Every
+    RoPE-aware path must go through here so prefill keys, decode queries and shifted prefill
+    queries share frequencies."""
     factor = _yarn_factor(context_tokens)
     if factor > 1:
         # nested text_config for multimodal Qwen3.5; fall back to top-level
@@ -189,11 +185,9 @@ def _apply_yarn(config: Any, context_tokens: int) -> int:
 
 
 def load_model_config(model_name: str, context_tokens: int = 0) -> Any:
-    """The HF config for `model_name` as the tier of `context_tokens` runs it:
-    YaRN-patched above the native window, untouched below. Use this -- not a bare
-    `AutoConfig.from_pretrained` -- wherever the config feeds anything RoPE-aware,
-    so scripts and commands can never shift queries with frequencies the prefill
-    did not use."""
+    """The HF config for `model_name` at this tier: YaRN-patched above the native window, untouched
+    below. Use this (not a bare `AutoConfig.from_pretrained`) wherever the config feeds anything
+    RoPE-aware, so queries can't be shifted with frequencies the prefill didn't use."""
     config = AutoConfig.from_pretrained(model_name)
     _apply_yarn(config, context_tokens)
     return config

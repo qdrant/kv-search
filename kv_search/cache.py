@@ -715,15 +715,10 @@ class RecordingCache(DynamicCache):
                 }
             ).encode()
 
-            # make sure the header fits in its slot
             assert len(header) <= 256 - 8
-
-            # pad header with space, which is valid json
-            header += b" " * (256 - 8 - len(header))
+            header += b" " * (256 - 8 - len(header))  # pad with spaces (valid json)
 
             f.seek(0)
-
-            # write header size
             f.write((256 - 8).to_bytes(8, "little"))
 
             f.write(header)
@@ -942,21 +937,15 @@ def _causal_mask(q_len: int, k_len: int, dtype, device) -> torch.Tensor | None:
 def _make_attention_mask(
     attn_impl: str, q_len: int, k_len: int, dtype, device
 ) -> torch.Tensor | None:
-    # Need to dynamically create our attention mask because transformers does not have sane defaults for causal/attention masks during inference
-    # usually this is created beforehand, when the prompt is tokenized, but we don't know the context length then
+    # built here, not at tokenization time: the context length isn't known then
     if attn_impl not in ("sdpa", "eager"):
         return None
 
     return _causal_mask(q_len, k_len, dtype, device)
 
 
-# HACK: Most of this is somewhat specific to qwen3.5 and also implemented in the slowest possible way
-# generalizing and improving is tbd
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
-    """
+    """torch.repeat_interleave(x, dim=1, repeats=n_rep): [b, kv_heads, s, d] -> [b, kv_heads*n_rep, s, d]."""
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states

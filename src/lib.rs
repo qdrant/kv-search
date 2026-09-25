@@ -58,9 +58,8 @@ mod _native {
     }
 
     impl NativeEdgeRetriever {
-        /// Each KV head's query rows, q-head major and token minor, as one contiguous [4·q_len, d]
-        /// block. Groups of 4 q-heads per KV head (Qwen3.5-9B, the only model `--tailm` admits;
-        /// `TailmRuntime.group` is 4 there too).
+        /// Per KV head, its 4 q-heads' rows as one contiguous [4·q_len, d] block (Qwen3.5-9B: 4
+        /// q-heads per KV head).
         fn queries(q: &PyReadonlyArray3<'_, f32>) -> Vec<(usize, Vec<f32>)> {
             let arr = q.as_array();
             let q_heads = arr.shape()[0];
@@ -113,11 +112,7 @@ mod _native {
                 )
                 .map_err(|e| e.to_string())?;
 
-            // logit_i = score_i * scaling
-            // m = max(logit_i for all i)
-            // w_i = exp(logit_i - m)
-            // lse = m + ln(sum(w_i))
-            // out = sum(w_i * v_i) / sum(w_i)
+            // stable softmax over scaled scores: out = Σ softmax(logit)·v, lse = logsumexp(logit)
             batch
                 .into_iter()
                 .map(|points| {
@@ -246,7 +241,6 @@ mod _native {
             let (q_heads, q_len, d) = (q.shape()[0], q.shape()[1], q.shape()[2]);
             let queries = Self::queries(&q);
 
-            // per query head and query token: (out, lse, boundary)
             let results: Vec<Rows> = queries
                 .into_par_iter()
                 .map(|(h, x)| self.search_merge(layer_idx, h, &x, d, limit, scaling))
@@ -396,13 +390,11 @@ mod _native {
             Ok(())
         }
 
-        /// Drop every registered tail.
         fn clear_tailm(&mut self) {
             self.tails.clear();
         }
 
-        /// Use another decode-tail kernel (`"avx2"` / `"neon"` if this CPU has it, or `"portable"`); for tests
-        /// and benchmarks.
+        /// Override the decode-tail kernel (`"avx2"`/`"neon"` if supported, else `"portable"`); tests only.
         fn set_tailm_kernel(&mut self, name: &str) -> PyResult<()> {
             self.kernel = Kernel::from_name(name).ok_or_else(|| {
                 PyValueError::new_err(format!("unknown or unsupported tail kernel {name:?}"))
