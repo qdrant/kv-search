@@ -45,12 +45,12 @@ def _session_queries(
 
 
 def _hnsw_topn(
-    shard: edge.EdgeShard, q, n: int, hnsw_ef: int | None, batch: int = 512
+    shard: edge.EdgeShard, q, n: int, hnsw_ef: int | None
 ) -> list[list[int]]:
     """Top-n ids per query row of `q` [B, d] (numpy f32), HNSW search at `hnsw_ef`."""
     out: list[list[int]] = []
-    for s in range(0, len(q), batch):
-        reqs = [
+    for i in range(len(q)):
+        r = shard.query(
             edge.QueryRequest(
                 query=edge.Query.Nearest(query=q[i], using="key"),
                 params=edge.SearchParams(exact=False, hnsw_ef=hnsw_ef),
@@ -58,9 +58,8 @@ def _hnsw_topn(
                 with_vector=None,
                 limit=n,
             )
-            for i in range(s, min(s + batch, len(q)))
-        ]
-        out.extend([int(p.id) for p in r] for r in shard.query_batch(reqs))
+        )
+        out.append([int(p.id) for p in r])
     return out
 
 
