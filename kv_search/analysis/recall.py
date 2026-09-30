@@ -45,15 +45,27 @@ def _session_queries(
 
 
 def _hnsw_topn(
-    shard: edge.EdgeShard, q, n: int, hnsw_ef: int | None
+    shard: edge.EdgeShard,
+    q,
+    n: int,
+    hnsw_ef: int | None,
+    rescore: bool | None = None,
+    oversampling: float | None = None,
 ) -> list[list[int]]:
-    """Top-n ids per query row of `q` [B, d] (numpy f32), HNSW search at `hnsw_ef`."""
+    """Top-n ids per query row of `q` [B, d] (numpy f32), HNSW search at `hnsw_ef`. On a quantized
+    shard, `rescore` toggles rescoring the candidates on the original vectors; None leaves the
+    server default (no quantization params sent, so f32/f16 shards are unaffected)."""
+    quant = (
+        None
+        if rescore is None
+        else edge.QuantizationSearchParams(rescore=rescore, oversampling=oversampling)
+    )
     out: list[list[int]] = []
     for i in range(len(q)):
         r = shard.query(
             edge.QueryRequest(
                 query=edge.Query.Nearest(query=q[i], using="key"),
-                params=edge.SearchParams(exact=False, hnsw_ef=hnsw_ef),
+                params=edge.SearchParams(exact=False, hnsw_ef=hnsw_ef, quantization=quant),
                 with_payload=False,
                 with_vector=None,
                 limit=n,
@@ -73,6 +85,8 @@ def edge_recall(
     top_n: int,
     hnsw_ef: int | None,
     device: str,
+    rescore: bool | None = None,
+    oversampling: float | None = None,
     q_block: int = 2048,
     key_chunk: int = 16384,
 ) -> list[dict]:
@@ -90,7 +104,9 @@ def edge_recall(
             hs = scan(qb[None], K[None], V[None], scaling, top_n, key_chunk, moments=False).head(0)
             # exact top-n softmax weights over the whole prefill: exp(scaled - m) / D
             w = torch.exp(hs.top_sc - hs.m[:, None]) / hs.D[:, None]  # [B, n]
-            ret = _hnsw_topn(shard, qb.detach().cpu().numpy(), top_n, hnsw_ef)
+            ret = _hnsw_topn(
+                shard, qb.detach().cpu().numpy(), top_n, hnsw_ef, rescore, oversampling
+            )
             ex_ids = hs.top_ix.tolist()
             for j, ret_j in enumerate(ret):
                 got = set(ret_j)

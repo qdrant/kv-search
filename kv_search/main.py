@@ -13,10 +13,16 @@ import qdrant_edge as edge
 import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
+    CompressionRatio,
     Datatype,
     Distance,
     HnswConfigDiff,
     OptimizersConfigDiff,
+    ProductQuantization,
+    ProductQuantizationConfig,
+    ScalarQuantization,
+    ScalarQuantizationConfig,
+    ScalarType,
     VectorParams,
     VectorParamsDiff,
 )
@@ -293,7 +299,10 @@ def _upsert(
     only: set[str] | None = None,
     segments: int = 1,
     vectors_on_disk: bool = True,
-    datatype: Datatype | None = None,
+    key_datatype: Datatype | None = None,
+    value_datatype: Datatype | None = None,
+    key_quant: Any = None,
+    value_quant: Any = None,
 ):
     """Upload every (full-attention layer, KV head) into its own collection, let the server
     build the key HNSW graph, and unpack its snapshot into `edge_root/layerLL_headH`.
@@ -375,14 +384,16 @@ def _upsert(
                     size=d,
                     distance=Distance.DOT,
                     on_disk=vectors_on_disk,
-                    datatype=datatype,
+                    datatype=key_datatype,
+                    quantization_config=key_quant,
                     hnsw_config=HnswConfigDiff(m=0, on_disk=vectors_on_disk),
                 ),
                 "value": VectorParams(
                     size=d,
                     distance=Distance.DOT,
                     on_disk=vectors_on_disk,
-                    datatype=datatype,
+                    datatype=value_datatype,
+                    quantization_config=value_quant,
                     hnsw_config=HnswConfigDiff(m=0),
                 ),
             },
@@ -1666,19 +1677,40 @@ class CmdRecord(BaseModel):
                     sys.stdin = orig
 
 
-# storage-datatype variants (direct float storage). int8/turbo4/PQ are quantization_config,
-# not a datatype (they learn a mapping and rescore), and are wired separately.
-_VARIANT_DATATYPE: dict[str, Datatype | None] = {
-    "f32": None,
-    "f16": Datatype.FLOAT16,
-}
+def _scalar_int8() -> ScalarQuantization:
+    return ScalarQuantization(
+        scalar=ScalarQuantizationConfig(type=ScalarType.INT8, quantile=0.99, always_ram=True)
+    )
+
+
+def _pq(ratio: CompressionRatio) -> ProductQuantization:
+    return ProductQuantization(
+        product=ProductQuantizationConfig(compression=ratio, always_ram=True)
+    )
+
+
+# variant -> (key_datatype, key_quant, value_datatype, value_quant). The recall sweep varies the
+# key encoding (values don't affect ranking); values stay f16 (free) for the quantized variants.
+# Quantized keys keep an f32 original for rescore; the code is what a quantized-only fetch pulls.
+def _variant_spec(variant: str) -> tuple:
+    f16 = Datatype.FLOAT16
+    specs: dict[str, tuple] = {
+        "f32": (None, None, None, None),
+        "f16": (f16, None, f16, None),
+        "int8": (None, _scalar_int8(), f16, None),
+        "pq16": (None, _pq(CompressionRatio.X16), f16, None),
+        "pq32": (None, _pq(CompressionRatio.X32), f16, None),
+    }
+    if variant not in specs:
+        raise SystemExit(f"error: unknown variant {variant!r}; pick {sorted(specs)}")
+    return specs[variant]
 
 
 class CmdRebuildShards(BaseModel):
     """Rebuild edge shards as HNSW-indexed single-segment shards from the existing prefill (no
-    re-prefill). Needs qdrant running at `url`. `variant` sets the key/value storage datatype and
-    the output folder: f32 -> edge (default), else edge_<variant>. `cells` (e.g. 15:0,31:0) limits
-    the build; empty builds all full-attention cells."""
+    re-prefill). Needs qdrant running at `url`. `variant` sets the key/value encoding and the
+    output folder: f32 -> edge (default), else edge_<variant> (f16/int8/pq16/pq32). `cells`
+    (e.g. 15:0,31:0) limits the build; empty builds all full-attention cells."""
 
     sizes: str = "100k,200k,1M"
     variant: str = "f32"
@@ -1689,7 +1721,7 @@ class CmdRebuildShards(BaseModel):
 
     def cli_cmd(self) -> None:
         config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
-        datatype = _VARIANT_DATATYPE[self.variant]
+        kd, kq, vd, vq = _variant_spec(self.variant)
         only = (
             {_shard_name(*(int(x) for x in c.split(":"))) for c in self.cells.split(",")}
             if self.cells
@@ -1701,8 +1733,8 @@ class CmdRebuildShards(BaseModel):
             cache, ctx = load_cache(cache_dir, config, "cpu")
             console.print(f"[{size}] ctx={ctx}; upserting {self.variant} -> {cache_dir}/{sub}")
             _upsert(
-                cache, self.url, edge_root=cache_dir / sub, parallel=1,
-                only=only, datatype=datatype,
+                cache, self.url, edge_root=cache_dir / sub, parallel=1, only=only,
+                key_datatype=kd, value_datatype=vd, key_quant=kq, value_quant=vq,
             )
             del cache
             console.print(f"[green]{size} done[/]")
@@ -1733,6 +1765,8 @@ class CmdRecall(BaseModel):
     variant: str = "f32"
     top_n: int = 128
     hnsw_ef: int | None = None
+    rescore: bool = False
+    oversampling: float | None = None
     n_sessions: int | None = None
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
@@ -1745,6 +1779,9 @@ class CmdRecall(BaseModel):
         config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
         cells = [tuple(int(x) for x in c.split(":")) for c in self.cells.split(",")]
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        quantized = self.variant not in ("f32", "f16")
+        rescore = self.rescore if quantized else None  # only meaningful with a code
+        name = f"recall_{self.variant}" + ("_rescore" if (quantized and self.rescore) else "")
         sizes_out: dict = {}
         for size in self.sizes.split(","):
             cache_dir = _cache_dir(self.dataset_name, size, config.model_type)
@@ -1759,13 +1796,17 @@ class CmdRecall(BaseModel):
                 "cells": recall.edge_recall(
                     cache_dir, edge_root, cells, sessions, d.scaling,
                     d.num_key_value_groups, self.top_n, self.hnsw_ef, device,
+                    rescore=rescore, oversampling=self.oversampling,
                 ),
             }
-            console.print(f"[green]recall {self.variant}/{size} done[/]")
+            console.print(f"[green]recall {name}/{size} done[/]")
         path = io.write_envelope(
-            f"recall_{self.variant}",
+            name,
             self.model_name,
-            {"variant": self.variant, "top_n": self.top_n, "hnsw_ef": self.hnsw_ef},
+            {
+                "variant": self.variant, "top_n": self.top_n, "hnsw_ef": self.hnsw_ef,
+                "rescore": rescore, "oversampling": self.oversampling,
+            },
             sizes_out,
         )
         console.print(f"[green]wrote {path}[/]")
