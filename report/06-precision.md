@@ -59,8 +59,24 @@ Below int8 the code stops preserving the ranking. Product quantization compresse
 
 PQ ×16 costs ~0.16 recall, PQ ×32 roughly halves it. So on the retrieval axis the practical floor is **int8 — a clean 4× at no cost — with PQ trading steep recall for the further 4–8×.**
 
-PQ keeps the f32 original, so rescoring the top candidates on the originals should recover much of this — but only with **oversampling above 1**. At oversampling 1 the search rescores exactly the `ef` candidates it already returns, so the returned set (and recall@n, which is set membership) cannot change; that is why every rescored column matched quantized-only exactly. How far rescore-with-oversampling walks PQ back toward f32, and at what added rescore-fetch, is the next measurement.
+## Rescore recovers it — at a cost
+
+PQ keeps the f32 original, so rescoring the top candidates on the originals recovers the lost recall. With `oversampling=4` (gather ~4×128 candidates on the codes, re-rank on the f32 originals, return the best 128):
+
+| cell | f32 (ef 128) | int8 only → rescore | pq16 only → rescore | pq32 only → rescore |
+|---|---|---|---|---|
+| L15H0 | 0.7910 | 0.789 → 0.943 | 0.633 → 0.927 | 0.462 → 0.790 |
+| L31H0 | 0.6769 | 0.682 → 0.882 | 0.546 → 0.835 | 0.388 → 0.708 |
+
+![PQ/int8 recall recovery via rescore at 1M, top-128: quantized-only vs rescore (oversampling 4) per config, against the f32 (ef 128) reference. Rescore lifts every code back to or above f32.](precision_rescore.png)
+
+pq32 rescored matches f32; pq16 and int8 rescored *exceed* it. Two caveats keep this honest:
+
+- **Part of the lift is wider search, not precision.** `oversampling=4` makes the walk gather ~512 candidates — effectively `ef≈512` against the f32 baseline's `ef=128` — so rescore beats f32 partly because it searches wider, and an f32 shard at the same `ef` would rise too.
+- **Rescore fetches the f32 originals.** Its download is `code×(scored) + f32×(oversampling·128 rescored)`, not the code size — so a 32 B code that rescores 512 originals per query is not a 32 B fetch. Rescore is the "small codes + rescore fetch" fetch model, whose net byte value needs the same K-style accounting as §05, not the storage-byte axis of the Pareto above.
+
+So the clean, unambiguous win stays **int8 quantized-only** — 256 B, f32-equal recall, no rescore fetch. PQ+rescore is a recall-recovery lever whose payoff depends on that fetch accounting (and is cheaper if the rescored originals are themselves f16).
 
 ## Next
 
-Two threads: the PQ rescore-recovery curve (oversampling vs recovered recall vs added rescore bytes), and the end-to-end **accuracy** pass — output error, not just recall, where **value** precision enters (values only feed the softmax-weighted average, so they should compress far harder than keys) and where tail correction reconstructs the mass a coarse code drops.
+The rescore byte accounting (oversampling vs recovered recall vs originals fetched, under the §05 cache model), and the end-to-end **accuracy** pass — output error, not just recall, where **value** precision enters (values only feed the softmax-weighted average, so they should compress far harder than keys) and where tail correction reconstructs the mass a coarse code drops.

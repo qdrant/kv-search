@@ -222,6 +222,32 @@ def make_figures(fig_dir: Path = FIG_DIR) -> list[Path]:
         fig.suptitle(f"Edge storage precision vs retrieval quality ({size}, top-128)")
         save(fig, "precision_pareto.png")
 
+    # PQ/int8 recall recovery: quantized-only vs rescore (oversampling), against the f32 ref.
+    qorder = ["pq32", "pq16", "int8"]
+    only = {v: _sizes(f"recall_{v}") for v in qorder}
+    resc = {v: _sizes(f"recall_{v}_rescore") for v in qorder}
+    f32e = _sizes("recall_f32")
+    if f32e and all(only.values()) and all(resc.values()):
+        size = "1M" if "1M" in f32e else _order(f32e)[-1]
+        cells = [(c["layer"], c["head"]) for c in f32e[size]["cells"]]
+        fig, axes = plt.subplots(1, len(cells), figsize=(5.2 * len(cells), 4.2), layout="constrained")
+        for ax, (L, H) in zip(np.atleast_1d(axes), cells):
+            x = np.arange(len(qorder))
+            ax.bar(x - 0.2, [_cell(only[v][size]["cells"], L, H)["recall"] for v in qorder],
+                   0.4, label="quantized-only", color="#c25708")
+            ax.bar(x + 0.2, [_cell(resc[v][size]["cells"], L, H)["recall"] for v in qorder],
+                   0.4, label="rescore (os=4)", color="#0d7d8a")
+            ax.axhline(_cell(f32e[size]["cells"], L, H)["recall"], ls="--", color="#55657a",
+                       lw=1.2, label="f32 (ef=128)")
+            ax.set_xticks(x)
+            ax.set_xticklabels(qorder)
+            ax.set_ylim(0, 1)
+            ax.set_title(f"L{L}H{H}")
+            ax.set_ylabel("recall@128")
+            ax.legend(fontsize=8)
+        fig.suptitle(f"PQ/int8 recall recovery via rescore ({size}, top-128)")
+        save(fig, "precision_rescore.png")
+
     return written
 
 
