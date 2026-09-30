@@ -40,14 +40,27 @@ Below f16, qdrant's scalar quantization maps each key component to an int8 code 
 | L15H0 | 0.7910 | 0.7890 | 0.7890 | 0.8490 → 0.8521 |
 | L31H0 | 0.6769 | 0.6820 | 0.6820 | 0.7370 → 0.7331 |
 
-Every delta is within noise, and quantized-only equals rescored **exactly** — int8's top-128 already matches f32's, so rescoring the candidates on the originals changes nothing. Retrieval quality is flat from 1024 B down to 256 B/key.
+Every delta is within noise. (Quantized-only and rescored read identical here for a mechanical reason spelled out under PQ below — at oversampling 1, rescoring cannot change the returned set.) Retrieval quality is flat from 1024 B down to 256 B/key.
 
-![Edge storage precision vs retrieval quality at 1M, top-128: recall and weight recall against stored bytes per key, per cell. Quality is flat from f32 (1024 B) through f16 (512 B) to int8 (256 B).](precision_pareto.png)
+![Edge storage precision vs retrieval quality at 1M, top-128: recall and weight recall against stored bytes per key, per cell. Quality is flat from f32 (1024 B) through int8 (256 B), then falls sharply under product quantization (64 B, 32 B).](precision_pareto.png)
 
 **Down to int8, precision is a free 4× on the edge download** — no measurable retrieval cost, deployable today (qdrant `datatype: Float16`, or scalar `quantization_config`), and it composes directly with the count reductions of §03–§05.
 
 > Baseline note: our f32 recall (L15H0 0.791, L31H0 0.677) runs below the colleague's graph-visits baseline (0.846 / 0.758) because these shards build at `ef_construct=100` (his 400) and replay a different recorded session set. The precision deltas above are measured on our own shards and queries, so they are unaffected.
 
+## Product quantization: where it bends
+
+Below int8 the code stops preserving the ranking. Product quantization compresses the key far harder — X16 to 64 B, X32 to 32 B — and recall falls off a cliff (quantized-only, scores read from the codes):
+
+| cell | f32 (1024 B) | pq16 (64 B) | pq32 (32 B) |
+|---|---|---|---|
+| L15H0 | 0.7910 | 0.6330 | 0.4623 |
+| L31H0 | 0.6769 | 0.5458 | 0.3879 |
+
+PQ ×16 costs ~0.16 recall, PQ ×32 roughly halves it. So on the retrieval axis the practical floor is **int8 — a clean 4× at no cost — with PQ trading steep recall for the further 4–8×.**
+
+PQ keeps the f32 original, so rescoring the top candidates on the originals should recover much of this — but only with **oversampling above 1**. At oversampling 1 the search rescores exactly the `ef` candidates it already returns, so the returned set (and recall@n, which is set membership) cannot change; that is why every rescored column matched quantized-only exactly. How far rescore-with-oversampling walks PQ back toward f32, and at what added rescore-fetch, is the next measurement.
+
 ## Next
 
-The bend is below int8. Product quantization (X16 → 64 B, X32 → 32 B) is where the code stops preserving the ranking and rescoring the top candidates on the originals starts to matter — the point at which the fetch model turns from "flatly smaller vectors" into "small codes plus a rescore fetch." Those points fill in the figure next, with keys and values as independent knobs, and feed the end-to-end accuracy pass (where value precision, not just key ranking, enters).
+Two threads: the PQ rescore-recovery curve (oversampling vs recovered recall vs added rescore bytes), and the end-to-end **accuracy** pass — output error, not just recall, where **value** precision enters (values only feed the softmax-weighted average, so they should compress far harder than keys) and where tail correction reconstructs the mass a coarse code drops.
