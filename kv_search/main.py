@@ -1697,6 +1697,54 @@ class CmdReport(BaseModel):
         console.print(f"[green]wrote {path}[/]")
 
 
+class CmdRecall(BaseModel):
+    """Edge HNSW recall@n / weight recall vs exact truth, per cell, for a shard variant.
+    Replays recorded sessions through a built shard; writes cache/analysis/recall_<variant>.json.
+    cells like `15:0,31:0`; variant `f32` reads `<cache>/edge`, else `<cache>/edge_<variant>`."""
+
+    sizes: str = "1M"
+    cells: str = "15:0,31:0"
+    variant: str = "f32"
+    top_n: int = 128
+    hnsw_ef: int | None = None
+    n_sessions: int | None = None
+    model_name: ModelName = "Qwen/Qwen3.5-9B"
+    dataset_name: Datasets = Datasets.QDRANT
+
+    def cli_cmd(self) -> None:
+        from kv_search.analysis import io, recall
+        from kv_search.analysis.data import CachedData
+        from kv_search.tailm_validate import open_sessions
+
+        config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
+        cells = [tuple(int(x) for x in c.split(":")) for c in self.cells.split(",")]
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        sizes_out: dict = {}
+        for size in self.sizes.split(","):
+            cache_dir = _cache_dir(self.dataset_name, size, config.model_type)
+            edge_root = cache_dir / ("edge" if self.variant == "f32" else f"edge_{self.variant}")
+            d = CachedData(cache_dir, model_name=self.model_name, load_prefill=False)
+            only = None if self.n_sessions is None else [
+                s.name for s in open_sessions(cache_dir / "replay")[: self.n_sessions]
+            ]
+            sessions = open_sessions(cache_dir / "replay", only=only)
+            sizes_out[size] = {
+                "context_len": d.context_len,
+                "cells": recall.edge_recall(
+                    cache_dir, edge_root, cells, sessions, d.scaling,
+                    d.num_key_value_groups, self.top_n, self.hnsw_ef, device,
+                ),
+            }
+            console.print(f"[green]recall {self.variant}/{size} done[/]")
+        path = io.write_envelope(
+            f"recall_{self.variant}",
+            self.model_name,
+            {"variant": self.variant, "top_n": self.top_n, "hnsw_ef": self.hnsw_ef},
+            sizes_out,
+        )
+        console.print(f"[green]wrote {path}[/]")
+
+
 class CmdKvSearch(
     BaseModel,
     cli_shortcuts={
@@ -1716,6 +1764,7 @@ class CmdKvSearch(
     figures: CliSubCommand[CmdFigures]
     record: CliSubCommand[CmdRecord]
     rebuild_shards: CliSubCommand[CmdRebuildShards]
+    recall: CliSubCommand[CmdRecall]
     report: CliSubCommand[CmdReport]
     eval: CliSubCommand[CmdEval]
 
