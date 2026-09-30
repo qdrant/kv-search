@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from kv_search.analysis import fetch
+from kv_search.analysis import fetch, precision
 from kv_search.analysis.data import CachedData
 
 
@@ -98,4 +98,6 @@ ANALYSES: dict[str, Analysis] = {
     "live_vs_retrieved": Analysis(fetch.live_vs_retrieved, needs_prefill=False, per_prompt=True),
     "cross_layer_coverage": Analysis(fetch.cross_layer_coverage, needs_prefill=False, per_prompt=True),
     "topk_mse": Analysis(fetch.topk_mse, needs_prefill=True, per_prompt=False),
+    # storage precision (edge quantization)
+    "f16_fidelity": Analysis(precision.f16_fidelity, needs_prefill=False, per_prompt=False),
 }
