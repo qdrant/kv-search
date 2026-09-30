@@ -195,7 +195,7 @@ def make_figures(fig_dir: Path = FIG_DIR) -> list[Path]:
 
     # edge storage precision: retrieval quality vs stored bytes/vector, per variant.
     # bytes per 256-d vector; extend as int8/turbo4/PQ variants are measured.
-    BYTES = {"f32": 1024, "f16": 512}
+    BYTES = {"f32": 1024, "f16": 512, "int8": 256, "pq16": 64, "pq32": 32}
     variants = {v: _sizes(f"recall_{v}") for v in BYTES}
     variants = {v: s for v, s in variants.items() if s}
     if len(variants) >= 2:
@@ -210,10 +210,11 @@ def make_figures(fig_dir: Path = FIG_DIR) -> list[Path]:
             xs = [x for x, _ in pts]
             for ax, key in zip(axes, ("recall", "weight_recall")):
                 ax.plot(xs, [c[key] for _, c in pts], "o-", label=f"L{L}H{H}")
+        present = {v: BYTES[v] for v in variants}
         for ax, key in zip(axes, ("recall@128", "weight recall")):
             ax.set_xscale("log", base=2)
-            ax.set_xticks(list(BYTES.values()))
-            ax.set_xticklabels([f"{v}\n{b} B" for v, b in BYTES.items()])
+            ax.set_xticks(list(present.values()))
+            ax.set_xticklabels([f"{v}\n{b} B" for v, b in present.items()])
             ax.set_xlabel("stored bytes / vector")
             ax.set_ylabel(key)
             ax.grid(True, alpha=.3)

@@ -31,12 +31,23 @@ Storage fidelity is not the whole story — the HNSW graph is built from f16-sco
 
 Every difference is within HNSW build nondeterminism (±0.002; the f16 graph is a fresh build, not the same topology as the f32 shard). f16 retrieval is indistinguishable from f32.
 
-![Edge storage precision vs retrieval quality at 1M, top-128: recall and weight recall against stored bytes per vector, per cell. f16 halves the bytes at unchanged quality.](precision_pareto.png)
+## int8 is nearly free too
 
-**f16 is a free 2× on the edge download** — half the bytes on both K and V, no measurable quality cost, and deployable today as qdrant `datatype: Float16` per named vector. It composes directly with the count reductions of §03–§05.
+Below f16, qdrant's scalar quantization maps each key component to an int8 code (256 B/key, 4× smaller than f32) and keeps the f32 original for optional rescoring. On the two tuned cells it costs no measurable recall:
+
+| cell | recall@128 f32 | int8 (quantized-only) | int8 (rescored) | weight recall f32 → int8 |
+|---|---|---|---|---|
+| L15H0 | 0.7910 | 0.7890 | 0.7890 | 0.8490 → 0.8521 |
+| L31H0 | 0.6769 | 0.6820 | 0.6820 | 0.7370 → 0.7331 |
+
+Every delta is within noise, and quantized-only equals rescored **exactly** — int8's top-128 already matches f32's, so rescoring the candidates on the originals changes nothing. Retrieval quality is flat from 1024 B down to 256 B/key.
+
+![Edge storage precision vs retrieval quality at 1M, top-128: recall and weight recall against stored bytes per key, per cell. Quality is flat from f32 (1024 B) through f16 (512 B) to int8 (256 B).](precision_pareto.png)
+
+**Down to int8, precision is a free 4× on the edge download** — no measurable retrieval cost, deployable today (qdrant `datatype: Float16`, or scalar `quantization_config`), and it composes directly with the count reductions of §03–§05.
 
 > Baseline note: our f32 recall (L15H0 0.791, L31H0 0.677) runs below the colleague's graph-visits baseline (0.846 / 0.758) because these shards build at `ef_construct=100` (his 400) and replay a different recorded session set. The precision deltas above are measured on our own shards and queries, so they are unaffected.
 
 ## Next
 
-The real Pareto is below f16. int8 (scalar quantization, learned min/max + rescore), Turbo4 (4-bit), and product quantization each trade recall for bytes — and, unlike a storage datatype, keep a full-precision original and rescore the top candidates, which reshapes the fetch model rather than flatly shrinking it. Those points fill in the figure next, keys and values as independent knobs.
+The bend is below int8. Product quantization (X16 → 64 B, X32 → 32 B) is where the code stops preserving the ranking and rescoring the top candidates on the originals starts to matter — the point at which the fetch model turns from "flatly smaller vectors" into "small codes plus a rescore fetch." Those points fill in the figure next, with keys and values as independent knobs, and feed the end-to-end accuracy pass (where value precision, not just key ranking, enters).
