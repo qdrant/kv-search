@@ -1666,10 +1666,11 @@ class CmdRecord(BaseModel):
                     sys.stdin = orig
 
 
+# storage-datatype variants (direct float storage). int8/turbo4/PQ are quantization_config,
+# not a datatype (they learn a mapping and rescore), and are wired separately.
 _VARIANT_DATATYPE: dict[str, Datatype | None] = {
     "f32": None,
     "f16": Datatype.FLOAT16,
-    "u8": Datatype.UINT8,
 }
 
 
