@@ -13,6 +13,7 @@ import qdrant_edge as edge
 import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
+    Datatype,
     Distance,
     HnswConfigDiff,
     OptimizersConfigDiff,
@@ -292,6 +293,7 @@ def _upsert(
     only: set[str] | None = None,
     segments: int = 1,
     vectors_on_disk: bool = True,
+    datatype: Datatype | None = None,
 ):
     """Upload every (full-attention layer, KV head) into its own collection, let the server
     build the key HNSW graph, and unpack its snapshot into `edge_root/layerLL_headH`.
@@ -373,12 +375,14 @@ def _upsert(
                     size=d,
                     distance=Distance.DOT,
                     on_disk=vectors_on_disk,
+                    datatype=datatype,
                     hnsw_config=HnswConfigDiff(m=0, on_disk=vectors_on_disk),
                 ),
                 "value": VectorParams(
                     size=d,
                     distance=Distance.DOT,
                     on_disk=vectors_on_disk,
+                    datatype=datatype,
                     hnsw_config=HnswConfigDiff(m=0),
                 ),
             },
@@ -1662,22 +1666,43 @@ class CmdRecord(BaseModel):
                     sys.stdin = orig
 
 
+_VARIANT_DATATYPE: dict[str, Datatype | None] = {
+    "f32": None,
+    "f16": Datatype.FLOAT16,
+    "u8": Datatype.UINT8,
+}
+
+
 class CmdRebuildShards(BaseModel):
-    """Rebuild edge shards as HNSW-indexed single-segment shards from the existing
-    prefill (no re-prefill). Needs qdrant running at `url`."""
+    """Rebuild edge shards as HNSW-indexed single-segment shards from the existing prefill (no
+    re-prefill). Needs qdrant running at `url`. `variant` sets the key/value storage datatype and
+    the output folder: f32 -> edge (default), else edge_<variant>. `cells` (e.g. 15:0,31:0) limits
+    the build; empty builds all full-attention cells."""
 
     sizes: str = "100k,200k,1M"
+    variant: str = "f32"
+    cells: str = ""
     url: str = "localhost"
     model_name: ModelName = "Qwen/Qwen3.5-9B"
     dataset_name: Datasets = Datasets.QDRANT
 
     def cli_cmd(self) -> None:
         config: PreTrainedConfig = AutoConfig.from_pretrained(self.model_name)
+        datatype = _VARIANT_DATATYPE[self.variant]
+        only = (
+            {_shard_name(*(int(x) for x in c.split(":"))) for c in self.cells.split(",")}
+            if self.cells
+            else None
+        )
+        sub = "edge" if self.variant == "f32" else f"edge_{self.variant}"
         for size in self.sizes.split(","):
             cache_dir = _cache_dir(self.dataset_name, size, config.model_type)
             cache, ctx = load_cache(cache_dir, config, "cpu")
-            console.print(f"[{size}] ctx={ctx}; upserting -> {cache_dir}/edge")
-            _upsert(cache, self.url, edge_root=cache_dir / "edge", parallel=1)
+            console.print(f"[{size}] ctx={ctx}; upserting {self.variant} -> {cache_dir}/{sub}")
+            _upsert(
+                cache, self.url, edge_root=cache_dir / sub, parallel=1,
+                only=only, datatype=datatype,
+            )
             del cache
             console.print(f"[green]{size} done[/]")
 
