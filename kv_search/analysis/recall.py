@@ -15,9 +15,10 @@ from pathlib import Path
 
 import qdrant_edge as edge
 import torch
+from safetensors import safe_open
 
 from kv_search.tailm_build import LayerReader, scan
-from kv_search.tailm_validate import Session, decode_rows
+from kv_search.tailm_validate import Session
 
 
 def _layer_reader(cache_dir: Path, layer: int) -> LayerReader:
@@ -26,6 +27,21 @@ def _layer_reader(cache_dir: Path, layer: int) -> LayerReader:
         if p.exists():
             return LayerReader(p)
     raise FileNotFoundError(f"{cache_dir}: no layer_{layer:02d} file")
+
+
+def _session_queries(
+    sessions: list[Session], layer: int, kv_head: int, group: int, device: str
+) -> torch.Tensor:
+    """Decode queries of one KV head over all sessions, ordered (session, step, q-head): [R, d] f32.
+    Reads only the queries (sessions recorded under -r native carry no attn_out)."""
+    qs = []
+    for s in sessions:
+        with safe_open(str(s.path), framework="pt") as f:
+            q = f.get_tensor(f"layer{layer:02d}/queries")[
+                :, kv_head * group : (kv_head + 1) * group
+            ]
+        qs.append(q.reshape(q.shape[0] * group, -1))
+    return torch.cat(qs).to(device, torch.float32)
 
 
 def _hnsw_topn(
@@ -66,7 +82,7 @@ def edge_recall(
         rd = _layer_reader(cache_dir, layer)
         K = rd.head("keys", head).to(device)  # bf16 [N, d]
         V = rd.head("values", head).to(device)
-        q = decode_rows(sessions, layer, head, group, scaling, torch.device(device)).q
+        q = _session_queries(sessions, layer, head, group, device)
         shard = edge.EdgeShard.load(str(edge_root / f"layer{layer:02d}_head{head}"))
         n_q = q.shape[0]
         rec_sum = wrec_sum = 0.0
