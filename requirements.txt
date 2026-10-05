@@ -1,0 +1,9 @@
+# Versions the demo was run and verified with (October 2026). Install torch for your CUDA version first:
+# https://pytorch.org/get-started/locally/
+torch>=2.14
+transformers>=5.17
+qdrant-client>=1.15
+numpy
+safetensors
+huggingface_hub
+textual>=8.2
