@@ -107,14 +107,19 @@ more text still gets more right answers. Re-judging the same answers moves the n
    pip install -r requirements.txt
    ```
 
-2. Get the checkpoint and the corpus from the shared folder (link from the authors) and put them here:
+2. Download the [`llm_memory` folder from Google Drive](https://drive.google.com/drive/folders/1g59BuvPFOL2FK1RSnOnMEVxzm002_iw4?usp=sharing)
+   and put its contents into the repository root. The demo needs two of its files:
 
    ```
    checkpoints/s2c.pt   # tower + reader, 1.6 GB
    data/docs.jsonl      # Qdrant corpus, 4,856 files, 30 MB
    ```
 
-   Hugging Face downloads the models on first use: `Qwen/Qwen3-4B-Instruct-2507`, `BAAI/bge-small-en-v1.5`, and
+   The folder also holds the evaluation questions (`data/questions-v.jsonl`), the training data (`data/train/`), and
+   `SHA256SUMS` to check the download with `sha256sum -c SHA256SUMS`.
+
+   Hugging Face downloads the models on first use: the frozen
+   [`Qwen/Qwen3-4B-Instruct-2507`](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507), `BAAI/bge-small-en-v1.5`, and
    `answerdotai/answerai-colbert-small-v1`. To use local copies, pass `--model`, `--bge`, and `--colbert`.
 
 3. Start Qdrant:
@@ -191,7 +196,7 @@ session with the commands `/ours`, `/mem`, `/rag`, `/colbert`, `/all`, `/thr 0.5
 ## Training
 
 Training data lives in `data/train/`: the corpus `docs.jsonl`, synthetic facts `facts-0.jsonl` and `facts-1.jsonl`,
-generated questions `questions.jsonl`, and topic neighbors `neighbors.json`. It comes with the checkpoint, or you can
+generated questions `questions.jsonl`, and topic neighbors `neighbors.json`. It is in the same Google Drive folder as the checkpoint, or you can
 regenerate it as described in [the data generation guide](llm_memory/datagen/README.md).
 
 [`scripts/train.sh`](scripts/train.sh) runs the recipe in three stages on one 24 GB GPU:
