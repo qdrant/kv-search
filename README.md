@@ -90,8 +90,11 @@ more text still gets more right answers. Re-judging the same answers moves the n
 
 ## Requirements
 
-- An NVIDIA GPU with 16 GB of memory. The demo was run on an RTX 5080 and an RTX 4090.
-- 32 GB of RAM and about 75 GB of free disk: 33 GB for the local index and 36 GB for the Qdrant collection.
+- A GPU with 16 GB of memory. The demo was run on an NVIDIA RTX 5080 and RTX 4090, and on an AMD RX 9070 XT with
+  ROCm (PyTorch 2.14.1+rocm7.2). The LLM judge in the evaluation needs more: a 24 GB GPU, or any OpenAI-compatible
+  endpoint.
+- 32 GB of RAM and about 110 GB of free disk: 35 GB for the local index, up to 43 GB for the Qdrant collection while it
+  is optimized (38 GB after), 9 GB for the models, and 10 to 16 GB for the Python environment.
 - Qdrant 1.10 or later. The demo was run with Qdrant 1.19.1.
 - Python 3.10 or later, PyTorch 2.14, and Transformers 5.17. The code relies on the decoder-layer API of
   Transformers 5.
@@ -101,11 +104,15 @@ more text still gets more right answers. Re-judging the same answers moves the n
 
 ## Setup
 
-1. Install PyTorch for your CUDA version, then the rest:
+1. Install PyTorch for your GPU, then the rest. On AMD, take the ROCm build, for example
+   `pip install torch --index-url https://download.pytorch.org/whl/rocm7.2`; the code runs unchanged with the
+   device name `cuda`.
 
    ```bash
    pip install -r requirements.txt
    ```
+
+   Run every command below from the repository root.
 
 2. Download the [`llm_memory` folder from Google Drive](https://drive.google.com/drive/folders/1g59BuvPFOL2FK1RSnOnMEVxzm002_iw4?usp=sharing)
    and put its contents into the repository root. The demo needs two of its files:
@@ -122,25 +129,34 @@ more text still gets more right answers. Re-judging the same answers moves the n
    [`Qwen/Qwen3-4B-Instruct-2507`](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507), `BAAI/bge-small-en-v1.5`, and
    `answerdotai/answerai-colbert-small-v1`. To use local copies, pass `--model`, `--bge`, and `--colbert`.
 
-3. Start Qdrant:
+3. Start Qdrant. The client uses both ports: 6333 (REST) and 6334 (gRPC).
 
    ```bash
    docker run -d -p 6333:6333 -p 6334:6334 -v $(pwd)/qdrant_storage:/qdrant/storage qdrant/qdrant:v1.19.1
    ```
 
-4. Build the index. This encodes 6.7M tokens and takes about 15 minutes on an RTX 5080:
+   Without Docker, take `qdrant-x86_64-unknown-linux-gnu.tar.gz` from the
+   [v1.19.1 release](https://github.com/qdrant/qdrant/releases/tag/v1.19.1) and run
+   `QDRANT__STORAGE__STORAGE_PATH=$PWD/qdrant_storage ./qdrant`.
+
+4. Build the index. This encodes 6.7M tokens and takes about 15 minutes on an RTX 5080 (20 on an RX 9070 XT):
 
    ```bash
    python -m llm_memory index
    ```
 
-5. Upload it to Qdrant. This takes about 15 minutes, and the HNSW graph builds in the background a few minutes after:
+5. Upload it to Qdrant. This takes 15 to 35 minutes, and the HNSW graph builds in the background for about 8 minutes
+   after that:
 
    ```bash
    python -m llm_memory upload
    ```
 
-6. Build the baseline collections for side-by-side comparison (`rag_bge` and `rag_colbert`, about 7 minutes):
+   The collection is ready when `curl -s localhost:6333/collections/llm_memory` shows `"status":"green"` and
+   `indexed_vectors_count` equals `points_count`. Before that, a question can spend a minute in kNN.
+
+6. Build the baseline collections for side-by-side comparison (`rag_bge` and `rag_colbert`, 7 to 14 minutes; it can
+   run while the upload is in progress):
 
    ```bash
    python -m llm_memory baselines
@@ -159,9 +175,13 @@ a map of what the model read in each found document, and where the time went.
 | Key | Effect |
 |---|---|
 | Tab, Shift+Tab | Switch between memory with text, memory only, RAG with bge-small, and RAG with ColBERT for the same question. Answers are kept, so switching back is instant |
-| Ctrl+T | Cycle the abstain threshold: 0.8, 0.5, off. A lower threshold gives more "not in the text" and fewer wrong answers |
+| Ctrl+R | Show or hide the found places and what the model read in each document |
+| Ctrl+T | Cycle the abstain threshold: 0.8, 0.5, off, 0.9. A lower threshold gives more "not in the text" and fewer wrong answers |
 | Up, Down | Question history |
-| Ctrl+Q | Quit |
+| Ctrl+C, or type `exit` | Quit |
+
+The app draws on the terminal, so do not redirect its output. Loading ColBERT prints a report with
+`linear.weight | UNEXPECTED`; that is expected.
 
 By default the comparison is at an equal text budget. Our model gets 128 text tokens around each of 8 found places,
 1,024 in all, which is as much text as RAG reads in 4 chunks of 256 tokens. On top of that it reads memory: the token
@@ -232,7 +252,8 @@ python -m llm_memory.evaluate search --ckpt checkpoints/s2c.pt --idx data/index 
 # baseline retrieval on the same windows
 python -m llm_memory.retrievers bm25 --dump data/eval/bm25.json
 python -m llm_memory.retrievers dense --embedder BAAI/bge-small-en-v1.5 --kind bge --chunk 64 --dump data/eval/bge-64.json
-python -m llm_memory.retrievers colbert --dump data/eval/colbert.json
+python -m llm_memory.retrievers colbert --dump data/eval/colbert.json                 # needs pip install pylate
+python -m llm_memory.retrievers colbert --impl native --dump data/eval/colbert.json   # without pylate, within a point
 
 # answers: ours (memory + text of 4 windows, with the abstain curve) and RAG over any retrieval dump
 python -m llm_memory.evaluate read --reader ours --ckpt checkpoints/s2c.pt --retrieved data/eval/ours.json \
@@ -240,7 +261,8 @@ python -m llm_memory.evaluate read --reader ours --ckpt checkpoints/s2c.pt --ret
 python -m llm_memory.evaluate read --reader rag --retrieved data/eval/colbert.json --ret-method colbert \
     --dump-answers data/eval/answers/rag-colbert.jsonl
 
-# LLM judge, then the right / wrong / "not in the text" tallies and the abstain-threshold curve
+# LLM judge (needs a 24 GB GPU, or point --server at any OpenAI-compatible endpoint), then the right / wrong /
+# "not in the text" tallies and the abstain-threshold curve
 vllm serve stelterlab/Qwen3-30B-A3B-Instruct-2507-AWQ --served-model-name judge --port 8004 --max-model-len 4096
 python -m llm_memory.judge judge --server http://127.0.0.1:8004/v1 --answers data/eval/answers/ours.forced.jsonl,data/eval/answers/rag-colbert.jsonl
 python -m llm_memory.judge crag data/eval/answers/*.judged.jsonl

@@ -2,8 +2,9 @@
 
     python -m llm_memory tui --local-vectors
 
-Tab switches between memory, RAG with bge-small, and RAG with ColBERT for the same question (answers are kept, so
-switching back is instant); Ctrl+T cycles the abstain threshold; Up and Down walk through the question history.
+Tab switches between memory with text, memory only, RAG with bge-small, and RAG with ColBERT for the same question
+(answers are kept, so switching back is instant); Ctrl+R shows the found places and what the model read; Ctrl+T cycles
+the abstain threshold; Up and Down walk through the question history; Ctrl+C or typing exit quits.
 Below the answer: the probability that the answer is not in memory, a map of what the model read in each found
 document, and where the time went.
 """
@@ -177,6 +178,7 @@ class Answer(Widget):
     def __init__(self, info):
         super().__init__()
         self.info, self.q, self.mode, self.text, self.r, self.phase, self.frame, self.error = info, None, "ours", "", None, "", 0, ""
+        self.sources = False                                        # the map of what the model read: hidden until Ctrl+R
 
     def render(self):
         w = max(20, self.size.width)
@@ -193,6 +195,7 @@ class Answer(Widget):
             t.append("For example:\n", style="dim")
             for e in EXAMPLES:
                 t.append(f"  • {e}\n", style="italic grey62")
+            t.append("\nCtrl+C or typing exit quits.", style="dim")
             return t
         i = self.info
         sub = SUBTITLE[self.mode].format(c=i["chunk"], r=i["rag_k"], k=i["places"], t=i["text_win"], p=i["piece"],
@@ -221,7 +224,11 @@ class Answer(Widget):
                               f"vectors in {len(r['pieces'])} pieces (one per document)", style="dim"))
         else:
             parts.append(Text(f"{len(r['sources'])} chunks, {len(r['txt'])} text tokens", style="dim"))
-        parts += [Text(), doc_map(r, w), timing(r, w)]
+        if self.sources:
+            parts += [Text(), doc_map(r, w)]
+        else:
+            parts.append(Text("Ctrl+R shows the found places and what the model read", style="dim italic"))
+        parts += [Text(), timing(r, w)]
         return Group(*parts)
 
 
@@ -248,10 +255,12 @@ class MemoryApp(App):
     QuestionInput { margin: 1 1 0 1; border: round $accent; }
     #body { padding: 1 2; }
     """
-    BINDINGS = [Binding("tab", "mode(1)", "Next mode", priority=True),
-                Binding("shift+tab", "mode(-1)", "Previous mode", priority=True),
-                Binding("ctrl+t", "threshold", "Abstain threshold", priority=True),
-                Binding("ctrl+q", "quit", "Quit", priority=True)]
+    BINDINGS = [Binding("tab", "mode(1)", "Next mode", key_display="Tab", priority=True),
+                Binding("shift+tab", "mode(-1)", "Previous mode", key_display="Shift+Tab", priority=True),
+                Binding("ctrl+r", "sources", "Sources", key_display="Ctrl+R", priority=True),
+                Binding("ctrl+t", "threshold", "Abstain threshold", key_display="Ctrl+T", priority=True),
+                Binding("ctrl+c", "quit", "Quit", key_display="Ctrl+C", priority=True),
+                Binding("ctrl+q", "quit", show=False, priority=True)]
 
     def __init__(self, query, thr, info):
         super().__init__()
@@ -279,6 +288,9 @@ class MemoryApp(App):
 
     def on_input_submitted(self, ev):
         q = ev.value.strip()
+        if q.lower() in ("exit", "quit", "/exit", "/quit", ":q"):
+            self.exit()
+            return
         if not q or self.busy:
             return
         inp = self.query_one(QuestionInput)
@@ -337,6 +349,10 @@ class MemoryApp(App):
             self.header.refresh()
             return
         self.ask(self.answer.q, mode)
+
+    def action_sources(self):
+        self.answer.sources = not self.answer.sources
+        self.answer.refresh(layout=True)
 
     def action_threshold(self):
         if self.busy:

@@ -173,8 +173,6 @@ def evaluate(a, data, log):
     torch.cuda.empty_cache()
     if "ours" in methods or "ours-chunk" in methods:
         from .model import MemoryModel
-        if torch.version.hip:
-            torch.backends.cuda.enable_flash_sdp(False); torch.backends.cuda.enable_mem_efficient_sdp(False)
         mm = MemoryModel(a.model, a.ckpt, dev)
         tok = mm.tok
         log(f"tower {a.ckpt} (step {mm.step})")

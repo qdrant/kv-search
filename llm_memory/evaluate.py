@@ -364,8 +364,6 @@ def main():
     a = ap.parse_args()
     t0 = time.time()
     log = lambda s: print(f"{s} ({time.time() - t0:.0f}s)", flush=True)
-    if torch.version.hip:
-        torch.backends.cuda.enable_flash_sdp(False); torch.backends.cuda.enable_mem_efficient_sdp(False)
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(a.model)
     docs = load_docs_by_id(a.docs)
